@@ -88,7 +88,6 @@ class TusslePlugin:
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
                     preds = self.model([batch_slow, batch_fast])
                     probabilities = torch.softmax(preds, dim=1)
-            print(f"[TusslePlugin][DEBUG] Model probabilities: {probabilities.cpu().numpy()}")
             # 3. Apply your Grace Period Logic
             for idx, cam_id in enumerate(cams_ready_for_inference):
                 fight_score = probabilities[idx][1].item()
