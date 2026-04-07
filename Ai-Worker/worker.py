@@ -231,7 +231,6 @@ if __name__ == "__main__":
             # For TusslePlugin, pass a dict of {cam_id: raw_frame}
             for plugin in plugins:
                 # If you updated TusslePlugin to accept scene_state (Gatekeeper logic), 
-                # you can remove this isinstance check later.
                 if isinstance(plugin, TusslePlugin):
                     tussle_input = {cam_id: state["raw_frame"] for cam_id, state in scene_state.items()}
                     alerts = plugin.process_batch(tussle_input)

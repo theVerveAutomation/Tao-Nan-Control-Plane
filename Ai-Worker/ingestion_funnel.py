@@ -7,8 +7,6 @@ import os
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-# Replace these with your actual RTSP URLs. 
-# For testing without IP cameras, you can use 0 (for webcam) or a local "video.mp4" path.
 CAMERAS = [
     {"id": "cam1", "url": "./Tussle.mp4"},
 ]
@@ -67,6 +65,7 @@ def capture_stream(cam_id, stream_url):
             # --- OUR DROP-OLDEST QUEUE LOGIC ---
             if frame_queues[cam_id].full():
                 try:
+                    print(f"[{cam_id}] Queue full. Dropping oldest frame to make room for new one.")
                     frame_queues[cam_id].get_nowait()
                 except queue.Empty:
                     pass
@@ -102,7 +101,7 @@ def start_funnel():
     
     # Give cameras a second to warm up and fill the queues
     print("⏳ Warming up camera streams...")
-    time.sleep(2)
+    #time.sleep(2)
     print("✅ Funnel is active and streaming.")
     return threads
 
