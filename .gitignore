@@ -1,0 +1,15 @@
+/.venv
+.env
+Ai-Worker/yolov8n-pose.pt
+Ai-Worker/yolov8s-pose.pt
+
+# Ignore ALL venvs anywhere
+venv/
+**/venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Env
+.env
