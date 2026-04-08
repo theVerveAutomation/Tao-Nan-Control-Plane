@@ -8,8 +8,8 @@ import os
 # 1. CONFIGURATION
 # ==========================================
 CAMERAS = [
-    {"id": "cam1", "url": "./Tussle.mp4"},
-    #{"id": "cam2", "url": "./realfall_test3.mp4"},
+    #{"id": "cam1", "url": "./Tussle.mp4"},
+    {"id": "550e8400-e29b-41d4-a716-446655440000", "url": "./realfall_test3.mp4"},
 ]
 
 ENV = os.environ.get("ENV", "development").lower()
