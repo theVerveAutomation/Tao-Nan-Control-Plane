@@ -10,6 +10,7 @@ import os
 from ingestion_funnel import start_funnel, frame_queues, CAMERAS
 from plugins.tussle_slowfast import TusslePlugin
 from plugins.fall_rule_based import RuleBasedFallPlugin
+from video_recorder import ClipRecorder
 
 # ==========================================
 # 1. CONFIGURATION
@@ -53,7 +54,7 @@ class SharedBackbone:
         print("🧠 Initializing Shared Backbone (YOLOv8-Pose)...")
         # 'yolov8n-pose.pt' is extremely fast. 
         # If accuracy is slightly low, upgrade to 'yolov8s-pose.pt' (Small)
-        self.model = YOLO("yolov8n-pose.pt")
+        self.model = YOLO("yolov8s-pose.pt")
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model.to(self.device)
         print(f"✅ Backbone active on device: {self.device.upper()}")
@@ -77,7 +78,7 @@ class SharedBackbone:
         results = self.model.track(
             batch_frames, 
             persist=True, 
-            classes=[0], # Class 0 is 'person'
+            classes=[0], 
             verbose=False,
             tracker="botsort.yaml" 
         )
@@ -134,34 +135,33 @@ def send_webhook(alert_data, raw_frame):
     """Saves the alert snapshot and posts the JSON payload to Next.js."""
     cam_id = alert_data["cameraId"]
     event_type = alert_data["eventType"]
-    current_time = time.time()
+    
+    # NEW: Pull the synchronized timestamp passed from the main loop
+    current_time = alert_data["timestamp"] 
     
     # Check Cooldown
     if current_time - alert_cooldowns[cam_id][event_type] < 5.0:
         return
     alert_cooldowns[cam_id][event_type] = current_time
 
-    # Save Snapshot to the Next.js public folder
-    # NOTE: Ensure this path correctly points to your web-dashboard/public/alerts folder!
-    filename = f"{cam_id}_{event_type}_{int(current_time)}.jpg"
+    # Save Snapshot
+    filename = f"{cam_id}_{event_type}_{current_time}.jpg"
     filepath = f"../web-dashboard/public/alerts/{filename}" 
     
-    # Draw alert banner on the image
-    color = (0, 0, 255) if event_type == "tussle" else (0, 165, 255)
-    cv2.putText(raw_frame, f"ALERT: {event_type.upper()}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
     cv2.imwrite(filepath, raw_frame)
     
-    # Fire to Next.js
+    # NEW: Inject videoPath into the payload
     payload = {
         "cameraId": cam_id,
         "eventType": event_type,
         "confidence": alert_data["confidence"],
-        "imagePath": f"/alerts/{filename}"
+        "imagePath": f"/alerts/{filename}",
+        "videoPath": alert_data.get("videoPath") 
     }
     
     try:
-        #requests.post(NEXTJS_INGRESS_URL, json=payload, timeout=2)
-        print(f"🚨 WEBHOOK SENT: {event_type.upper()} on {cam_id}")
+        # requests.post(NEXTJS_INGRESS_URL, json=payload, timeout=2)
+        print(f"🚨 WEBHOOK SENT: {event_type.upper()} on {cam_id} (Video compiling in background...)")
     except Exception as e:
         print(f"⚠️ Webhook failed to send: {e}")
 
@@ -192,9 +192,12 @@ if __name__ == "__main__":
     # 3. Initialize the Split Brain Plugins
     print("🔌 Loading AI Plugins...")
     plugins = [
-        #RuleBasedFallPlugin(confidence_threshold=0.75, aspect_ratio_threshold=1.2),
-        TusslePlugin(model_path="./best_slowfast_fight_model (2).pth", camera_ids=camera_ids)
+        RuleBasedFallPlugin(confidence_threshold=0.75, aspect_ratio_threshold=1.2),
+        #TusslePlugin(model_path="./best_slowfast_fight_model (2).pth", camera_ids=camera_ids)
     ]
+
+    # Initialize the Video Recorder
+    recorder = ClipRecorder(before_frames=30, after_frames=30, fps=10)
     
     print("🚀 Master Loop Online. Analyzing streams...")
     
@@ -215,6 +218,10 @@ if __name__ == "__main__":
             if not scene_state:
                 continue
 
+            # NEW: Feed the raw frames into the rolling dashcam buffer
+            for cam_id, data in scene_state.items():
+                recorder.update_frame(cam_id, data["raw_frame"])
+
             if ENV == "development":
                 with display_lock:
                     for cam_id, state in scene_state.items():
@@ -223,17 +230,28 @@ if __name__ == "__main__":
             # C. Pass state to all Plugins
             # For TusslePlugin, pass a dict of {cam_id: raw_frame}
             for plugin in plugins:
+                # If you updated TusslePlugin to accept scene_state (Gatekeeper logic), 
                 if isinstance(plugin, TusslePlugin):
                     tussle_input = {cam_id: state["raw_frame"] for cam_id, state in scene_state.items()}
-                    # Debug print
                     alerts = plugin.process_batch(tussle_input)
                 else:
                     alerts = plugin.process_batch(scene_state)
 
-                # D. Process any triggered alerts
+                # Process any triggered alerts
                 for alert in alerts:
                     trigger_cam = alert["cameraId"]
                     trigger_frame = scene_state[trigger_cam]["raw_frame"]
+                    
+                    # NEW: Create a unified timestamp for this exact event
+                    timestamp = int(time.time())
+                    
+                    # NEW: Trigger the recorder. It returns the future path of the .mp4
+                    video_path = recorder.trigger(trigger_cam, alert["eventType"], timestamp)
+                    
+                    # NEW: Inject the data into the alert dictionary
+                    alert["timestamp"] = timestamp
+                    alert["videoPath"] = video_path
+                    
                     send_webhook(alert, trigger_frame)
                     
     except KeyboardInterrupt:
