@@ -54,7 +54,7 @@ class SharedBackbone:
         print("🧠 Initializing Shared Backbone (YOLOv8-Pose)...")
         # 'yolov8n-pose.pt' is extremely fast. 
         # If accuracy is slightly low, upgrade to 'yolov8s-pose.pt' (Small)
-        self.model = YOLO("yolov8n-pose.pt")
+        self.model = YOLO("yolov8s-pose.pt")
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model.to(self.device)
         print(f"✅ Backbone active on device: {self.device.upper()}")
@@ -193,7 +193,7 @@ if __name__ == "__main__":
     print("🔌 Loading AI Plugins...")
     plugins = [
         RuleBasedFallPlugin(confidence_threshold=0.75, aspect_ratio_threshold=1.2),
-        TusslePlugin(model_path="./best_slowfast_fight_model (2).pth", camera_ids=camera_ids)
+        #TusslePlugin(model_path="./best_slowfast_fight_model (2).pth", camera_ids=camera_ids)
     ]
 
     # Initialize the Video Recorder

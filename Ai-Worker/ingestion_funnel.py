@@ -8,7 +8,8 @@ import os
 # 1. CONFIGURATION
 # ==========================================
 CAMERAS = [
-    {"id": "cam1", "url": "./Tussle.mp4"},
+    #{"id": "cam1", "url": "./Tussle.mp4"},
+    {"id": "cam2", "url": "./realfall_test3.mp4"},
 ]
 
 ENV = os.environ.get("ENV", "development").lower()
@@ -65,7 +66,6 @@ def capture_stream(cam_id, stream_url):
             # --- OUR DROP-OLDEST QUEUE LOGIC ---
             if frame_queues[cam_id].full():
                 try:
-                    print(f"[{cam_id}] Queue full. Dropping oldest frame to make room for new one.")
                     frame_queues[cam_id].get_nowait()
                 except queue.Empty:
                     pass
