@@ -1,0 +1,4 @@
+/.venv
+.env
+Ai-Worker/yolov8n-pose.pt
+Ai-Worker/yolov8s-pose.pt
