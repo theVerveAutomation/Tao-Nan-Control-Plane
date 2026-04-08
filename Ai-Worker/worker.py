@@ -16,7 +16,7 @@ from video_recorder import ClipRecorder
 # 1. CONFIGURATION
 # ==========================================
 ENV = os.environ.get("ENV", "development").lower()
-NEXTJS_INGRESS_URL = "http://localhost:3000/api/ingress"
+ALERT_CREATE_URL = os.environ.get("ALERT_CREATE_URL", "http://localhost:3000/api/ingress")
 camera_ids = [cam["id"] for cam in CAMERAS]
 
 # Alert Cooldowns (1 alert per event type per camera every 5 seconds)
@@ -55,7 +55,9 @@ def display_loop(stop_event, display_frames, display_lock):
 class SharedBackbone:
     def __init__(self):
         print("🧠 Initializing Shared Backbone (YOLOv8-Pose)...")
-        self.model = YOLO("yolov8s-pose.pt")
+        # 'yolov8n-pose.pt' is extremely fast. 
+        # If accuracy is slightly low, upgrade to 'yolov8s-pose.pt' (Small)
+        self.model = YOLO("yolov8n-pose.pt")
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model.to(self.device)
         print(f"✅ Backbone active on device: {self.device.upper()}")
@@ -130,7 +132,7 @@ class SharedBackbone:
 # 3. EGRESS CONTROLLER (Webhooks & Saving)
 # ==========================================
 def send_webhook(alert_data, raw_frame):
-    """Saves the alert snapshot and posts the JSON payload to Next.js."""
+    """Saves the alert snapshot and posts alert payload to backend create-alert endpoint."""
     cam_id = alert_data["cameraId"]
     event_type = alert_data["eventType"]
     
@@ -144,6 +146,7 @@ def send_webhook(alert_data, raw_frame):
     # Save Snapshot
     filename = f"{cam_id}_{event_type}_{current_time}.jpg"
     filepath = f"../web-dashboard/public/alerts/{filename}" 
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
     
     cv2.imwrite(filepath, raw_frame)
     
@@ -156,10 +159,13 @@ def send_webhook(alert_data, raw_frame):
     }
     
     try:
-        # requests.post(NEXTJS_INGRESS_URL, json=payload, timeout=2)
-        print(f"🚨 WEBHOOK SENT: {event_type.upper()} on {cam_id} (Video compiling in background...)")
+        response = requests.post(ALERT_CREATE_URL, json=payload)
+        if response.ok:
+            print(f"🚨 ALERT SAVED: {event_type.upper()} on {cam_id} -> {ALERT_CREATE_URL}")
+        else:
+            print(f"⚠️ Alert API responded with {response.status_code}: {response.text[:200]}")
     except Exception as e:
-        print(f"⚠️ Webhook failed to send: {e}")
+        print(f"⚠️ Failed to call alert create endpoint ({ALERT_CREATE_URL}): {e}")
 
 # ==========================================
 # 4. MASTER EXECUTION LOOP
@@ -188,8 +194,8 @@ if __name__ == "__main__":
     # 3. Initialize the Split Brain Plugins
     print("🔌 Loading AI Plugins...")
     plugins = [
-        RuleBasedFallPlugin(confidence_threshold=0.75, aspect_ratio_threshold=1.2),
-        #TusslePlugin(model_path="./best_slowfast_fight_model (2).pth", camera_ids=camera_ids)
+        #RuleBasedFallPlugin(confidence_threshold=0.75, aspect_ratio_threshold=1.2),
+        TusslePlugin(model_path="./best_slowfast_fight_model (2).pth", camera_ids=camera_ids)
     ]
 
     # Initialize the Video Recorder
