@@ -22,6 +22,9 @@ camera_ids = [cam["id"] for cam in CAMERAS]
 # Alert Cooldowns (1 alert per event type per camera every 5 seconds)
 alert_cooldowns = {cam_id: {"fall": 0, "tussle": 0} for cam_id in camera_ids}
 
+# Fall persistence: (cam_id, track_id) → last_fall_time
+fall_persist = {}
+
 
 def display_loop(stop_event, display_frames, display_lock):
     """Dedicated display loop so rendering does not block AI processing."""
@@ -52,8 +55,6 @@ def display_loop(stop_event, display_frames, display_lock):
 class SharedBackbone:
     def __init__(self):
         print("🧠 Initializing Shared Backbone (YOLOv8-Pose)...")
-        # 'yolov8n-pose.pt' is extremely fast. 
-        # If accuracy is slightly low, upgrade to 'yolov8s-pose.pt' (Small)
         self.model = YOLO("yolov8s-pose.pt")
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model.to(self.device)
@@ -109,11 +110,8 @@ class SharedBackbone:
 
             for idx, track_id in enumerate(track_ids):
                 bbox = boxes[idx]
-                if ENV == "development":
-                    x1, y1, x2, y2 = map(int, bbox)
-                    color = (0, 255, 0)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(frame, f'ID:{track_id}', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+                # ✅ CHANGE 2: Removed green drawing from backbone entirely
 
                 person_data = {
                     "bbox": bbox,        
@@ -136,7 +134,6 @@ def send_webhook(alert_data, raw_frame):
     cam_id = alert_data["cameraId"]
     event_type = alert_data["eventType"]
     
-    # NEW: Pull the synchronized timestamp passed from the main loop
     current_time = alert_data["timestamp"] 
     
     # Check Cooldown
@@ -150,7 +147,6 @@ def send_webhook(alert_data, raw_frame):
     
     cv2.imwrite(filepath, raw_frame)
     
-    # NEW: Inject videoPath into the payload
     payload = {
         "cameraId": cam_id,
         "eventType": event_type,
@@ -213,24 +209,17 @@ if __name__ == "__main__":
                 time.sleep(0.01)
                 continue
                 
-            # B. Extract Geometry
+            # B. Extract Geometry (Step 1: YOLO → scene_state)
             scene_state = backbone.process_batch(current_batch)
             if not scene_state:
                 continue
 
-            # NEW: Feed the raw frames into the rolling dashcam buffer
+            # Feed the raw frames into the rolling dashcam buffer
             for cam_id, data in scene_state.items():
                 recorder.update_frame(cam_id, data["raw_frame"])
 
-            if ENV == "development":
-                with display_lock:
-                    for cam_id, state in scene_state.items():
-                        display_frames[cam_id] = state["raw_frame"].copy()
-
-            # C. Pass state to all Plugins
-            # For TusslePlugin, pass a dict of {cam_id: raw_frame}
+            # C. Pass state to all Plugins (Step 2: Plugin → alerts)
             for plugin in plugins:
-                # If you updated TusslePlugin to accept scene_state (Gatekeeper logic), 
                 if isinstance(plugin, TusslePlugin):
                     tussle_input = {cam_id: state["raw_frame"] for cam_id, state in scene_state.items()}
                     alerts = plugin.process_batch(tussle_input)
@@ -240,19 +229,54 @@ if __name__ == "__main__":
                 # Process any triggered alerts
                 for alert in alerts:
                     trigger_cam = alert["cameraId"]
+
+                    # ✅ Update fall_persist with timestamp for this track
+                    if alert["eventType"] == "fall":
+                        key = (trigger_cam, alert["trackId"])
+                        fall_persist[key] = time.time()
+
                     trigger_frame = scene_state[trigger_cam]["raw_frame"]
                     
-                    # NEW: Create a unified timestamp for this exact event
                     timestamp = int(time.time())
-                    
-                    # NEW: Trigger the recorder. It returns the future path of the .mp4
                     video_path = recorder.trigger(trigger_cam, alert["eventType"], timestamp)
                     
-                    # NEW: Inject the data into the alert dictionary
                     alert["timestamp"] = timestamp
                     alert["videoPath"] = video_path
                     
                     send_webhook(alert, trigger_frame)
+
+            # ✅ CHANGE 5: Draw RED/GREEN boxes after plugin loop
+            for cam_id, state in scene_state.items():
+                frame = state["raw_frame"]
+                tracked = state["tracked_people"]
+
+                for track_id, person in tracked.items():
+                    x1, y1, x2, y2 = map(int, person["bbox"])
+
+                    key = (cam_id, track_id)
+                    is_fall = False
+                    if key in fall_persist:
+                        if time.time() - fall_persist[key] < 3.0:  # 🔥 show for 3 sec
+                            is_fall = True
+                        else:
+                            del fall_persist[key]
+
+                    if is_fall:
+                        color = (0, 0, 255)   # 🔴 RED  — fall detected
+                        label = f"FALL ID {track_id}"
+                    else:
+                        color = (0, 255, 0)   # 🟢 GREEN — normal
+                        label = f"ID {track_id}"
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, label, (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            # ✅ CHANGE 6: Copy to display_frames AFTER drawing (correct order)
+            if ENV == "development":
+                with display_lock:
+                    for cam_id, state in scene_state.items():
+                        display_frames[cam_id] = state["raw_frame"].copy()
                     
     except KeyboardInterrupt:
         print("\n🛑 Shutting down system...")
