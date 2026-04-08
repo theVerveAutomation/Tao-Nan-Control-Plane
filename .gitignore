@@ -6,3 +6,14 @@ Ai-Worker/best_slowfast_fight_model (2).pth
 Ai-Worker/Fall.mp4
 Ai-Worker/realfall_test3.mp4
 Ai-Worker/Tussle.mp4
+
+# Ignore ALL venvs anywhere
+venv/
+**/venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Env
+.env
