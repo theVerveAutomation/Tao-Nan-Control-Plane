@@ -1,6 +1,6 @@
-import os
 import time
 
+from config import ENV
 from ingestion.recorder import EventRecorder
 from ingestion.service import IngestionService
 
@@ -11,7 +11,6 @@ except ImportError:
     print("⚠️ psycopg2 not installed. Database hot-reloading disabled.")
     DB_AVAILABLE = False
 
-ENV = os.environ.get("ENV", "development").lower()
 print(f"⚙️  Environment set to: {ENV.upper()}")
 
 # Singleton service used across the app

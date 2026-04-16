@@ -1,11 +1,13 @@
 import torch
 from ultralytics import YOLO
 
+from config import YOLO_MODEL_PATH
+
 
 class SharedBackbone:
     def __init__(self):
         print("🧠 Initializing Shared Backbone (YOLOv8-Pose)...")
-        self.model = YOLO("yolov8n-pose.pt")
+        self.model = YOLO(YOLO_MODEL_PATH)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model.to(self.device)
         print(f"✅ Backbone active on device: {self.device.upper()}")

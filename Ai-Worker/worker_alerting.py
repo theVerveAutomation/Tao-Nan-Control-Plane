@@ -4,12 +4,12 @@ from collections import defaultdict
 import cv2
 import requests
 
+from config import ALERT_COOLDOWN_SECONDS, ALERT_CREATE_URL
+
 
 class AlertDispatcher:
     def __init__(self, alert_create_url=None):
-        self.alert_create_url = alert_create_url or os.environ.get(
-            "ALERT_CREATE_URL", "http://localhost:3000/api/alerts"
-        )
+        self.alert_create_url = alert_create_url or ALERT_CREATE_URL
         self.alert_cooldowns = defaultdict(lambda: {"fall": 0, "tussle": 0})
 
     def send(self, alert_data, raw_frame):
@@ -17,7 +17,7 @@ class AlertDispatcher:
         event_type = alert_data["eventType"]
         current_time = alert_data["timestamp"]
 
-        if current_time - self.alert_cooldowns[cam_id][event_type] < 5.0:
+        if current_time - self.alert_cooldowns[cam_id][event_type] < ALERT_COOLDOWN_SECONDS:
             return
         self.alert_cooldowns[cam_id][event_type] = current_time
 

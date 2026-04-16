@@ -1,11 +1,20 @@
-import os
 import threading
 import time
 
 import cv2
 
+from config import (
+    CLIP_RECORDER_AFTER_FRAMES,
+    CLIP_RECORDER_BEFORE_FRAMES,
+    CLIP_RECORDER_FPS,
+    ENABLE_FALL_PLUGIN,
+    ENABLE_TUSSLE_PLUGIN,
+    ENV,
+    TUSSLE_MODEL_PATH,
+)
 from ingestion_funnel import CAMERA_CONFIG, frame_queues, get_ingestion_service, start_funnel
 from plugins.tussle_slowfast import TusslePlugin
+from plugins.fall_rule_based import RuleBasedFallPlugin
 from video_recorder import ClipRecorder
 from worker_alerting import AlertDispatcher
 from worker_backbone import SharedBackbone
@@ -14,7 +23,7 @@ from worker_display import display_loop
 
 class WorkerRuntime:
     def __init__(self, env=None):
-        self.env = (env or os.environ.get("ENV", "development")).lower()
+        self.env = (env or ENV).lower()
         self.stop_event = threading.Event()
         self.display_lock = threading.Lock()
         self.display_frames = {}
@@ -45,11 +54,17 @@ class WorkerRuntime:
             self.display_thread.start()
 
         print("🔌 Loading AI Plugins...")
-        self.plugins = [
-            TusslePlugin(model_path="./best_slowfast_fight_model (2).pth", camera_ids=self.camera_ids)
-        ]
+        self.plugins = []
+        if ENABLE_TUSSLE_PLUGIN:
+            self.plugins.append(TusslePlugin(model_path=TUSSLE_MODEL_PATH, camera_ids=self.camera_ids))
+        if ENABLE_FALL_PLUGIN:
+            self.plugins.append(RuleBasedFallPlugin())
 
-        self.recorder = ClipRecorder(before_frames=200, after_frames=200, fps=10)
+        self.recorder = ClipRecorder(
+            before_frames=CLIP_RECORDER_BEFORE_FRAMES,
+            after_frames=CLIP_RECORDER_AFTER_FRAMES,
+            fps=CLIP_RECORDER_FPS,
+        )
         print("🚀 Master Loop Online. Analyzing streams...")
 
     @staticmethod
@@ -123,7 +138,36 @@ class WorkerRuntime:
 
         with self.display_lock:
             for cam_id, state in scene_state.items():
+                # ensure display_frames contains the camera key (handles runtime-added cameras)
+                if cam_id not in self.display_frames:
+                    self.display_frames[cam_id] = None
                 self.display_frames[cam_id] = state["raw_frame"].copy()
+
+                # Auto-add camera id to runtime list if introduced at runtime
+                if cam_id not in self.camera_ids:
+                    print(f"🔔 [Runtime] New camera detected at runtime: {cam_id}. Adding to camera_ids.")
+                    self.camera_ids.append(cam_id)
+
+                    updated_plugins = []
+                    # Update plugins that track camera_ids (best-effort) and try reinitialization
+                    for plugin in self.plugins:
+                        if hasattr(plugin, "camera_ids") and isinstance(plugin.camera_ids, list):
+                            if cam_id not in plugin.camera_ids:
+                                plugin.camera_ids.append(cam_id)
+                                updated_plugins.append(plugin.__class__.__name__)
+
+                                # Call plugin hook if available to allow reinitialization for the new camera
+                                try:
+                                    if hasattr(plugin, "on_camera_added"):
+                                        plugin.on_camera_added(cam_id)
+                                    elif hasattr(plugin, "reinitialize"):
+                                        plugin.reinitialize(cam_id)
+                                except Exception:
+                                    # non-fatal; proceed to next plugin
+                                    pass
+
+                    if updated_plugins:
+                        print(f"🔧 [Runtime] Updated plugins for new camera {cam_id}: {', '.join(updated_plugins)}")
 
     def run(self):
         self.setup()
