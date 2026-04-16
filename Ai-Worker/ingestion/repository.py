@@ -85,6 +85,7 @@ class PostgresCameraRepository:
                 """
             )
             rows = curs.fetchall()
+            print(f"✅ [DB] Fetched {rows} rows")
 
             cameras_config = {}
             for row in rows:

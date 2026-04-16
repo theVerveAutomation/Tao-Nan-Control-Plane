@@ -8,7 +8,7 @@ import requests
 class AlertDispatcher:
     def __init__(self, alert_create_url=None):
         self.alert_create_url = alert_create_url or os.environ.get(
-            "ALERT_CREATE_URL", "http://localhost:3000/api/ingress"
+            "ALERT_CREATE_URL", "http://localhost:3000/api/alerts"
         )
         self.alert_cooldowns = defaultdict(lambda: {"fall": 0, "tussle": 0})
 
