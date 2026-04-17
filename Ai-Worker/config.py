@@ -62,6 +62,9 @@ RTMP_FFMPEG_BIN = os.environ.get("RTMP_FFMPEG_BIN", "ffmpeg")
 RTMP_VIDEO_CODEC = os.environ.get("RTMP_VIDEO_CODEC", "libx264")
 RTMP_FFMPEG_PRESET = os.environ.get("RTMP_FFMPEG_PRESET", "veryfast")
 
+# MediaMTX REST API base URL (paths endpoint)
+MEDIAMTX_BASE_URL = os.environ.get("MEDIAMTX_BASE_URL", "http://localhost:9997/v3/config/paths")
+
 
 def get_default_camera_config():
     return deepcopy(DEFAULT_CAMERA_CONFIG)

@@ -1,10 +1,12 @@
 import json
 import queue
+import re
 import select
 import threading
 import time
 
 import cv2
+import requests
 
 from config import (
     DEV_TARGET_FPS,
@@ -13,6 +15,7 @@ from config import (
     STREAM_MAX_READ_FAILURES,
     STREAM_RECONNECT_DELAY_SECONDS,
     get_default_camera_config,
+    MEDIAMTX_BASE_URL,
 )
 from .repository import PostgresCameraRepository
 
@@ -30,6 +33,75 @@ class IngestionService:
         self.frame_queues = {cam_id: queue.Queue(maxsize=FRAME_QUEUE_MAXSIZE) for cam_id in self.camera_config}
 
         self.repository = repository if repository is not None else PostgresCameraRepository()
+        self.mediamtx_base_url = MEDIAMTX_BASE_URL
+
+    @staticmethod
+    def _mediamtx_path_name(cam_id):
+        safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(cam_id))
+        return f"cam_{safe_id}"
+
+    def _upsert_mediamtx_path(self, cam_id, camera_row):
+        if not cam_id or not camera_row:
+            return
+
+        source_url = camera_row.get("stream_url") or camera_row.get("url")
+        if not source_url:
+            print(f"⚠️ [MediaMTX] Camera {cam_id} has no source URL. Skipping path upsert.")
+            return
+
+        path_name = self._mediamtx_path_name(cam_id)
+        payload = {
+            "name": path_name,
+            "source": source_url,
+            "sourceOnDemand": True,
+        }
+
+        # Primary call follows requested endpoint shape; fallback supports path-name URL styles.
+        try:
+            response = requests.post(self.mediamtx_base_url, json=payload, timeout=3)
+            if response.status_code not in (200, 201, 204):
+                alt_url = f"{self.mediamtx_base_url}/{path_name}"
+                alt_payload = {
+                    "source": source_url,
+                    "sourceOnDemand": True,
+                }
+                alt_response = requests.post(alt_url, json=alt_payload, timeout=3)
+                if alt_response.status_code not in (200, 201, 204):
+                    print(
+                        f"⚠️ [MediaMTX] Failed to upsert path {path_name}. "
+                        f"POST {self.mediamtx_base_url} -> {response.status_code}; "
+                        f"POST {alt_url} -> {alt_response.status_code}"
+                    )
+                    return
+            print(f"✅ [MediaMTX] Upserted path {path_name} (sourceOnDemand=true)")
+        except Exception as exc:
+            print(f"❌ [MediaMTX] Upsert failed for camera {cam_id}: {exc}")
+
+    def _delete_mediamtx_path(self, cam_id):
+        if not cam_id:
+            return
+
+        path_name = self._mediamtx_path_name(cam_id)
+        target_url = f"{self.mediamtx_base_url}/{path_name}"
+
+        try:
+            response = requests.delete(target_url, timeout=3)
+            if response.status_code in (200, 202, 204, 404):
+                print(f"✅ [MediaMTX] Deleted path {path_name}")
+                return
+
+            # Fallback for APIs expecting payload on collection endpoint
+            fallback_response = requests.delete(self.mediamtx_base_url, json={"name": path_name}, timeout=3)
+            if fallback_response.status_code in (200, 202, 204, 404):
+                print(f"✅ [MediaMTX] Deleted path {path_name}")
+            else:
+                print(
+                    f"⚠️ [MediaMTX] Failed to delete path {path_name}. "
+                    f"DELETE {target_url} -> {response.status_code}; "
+                    f"DELETE {self.mediamtx_base_url} -> {fallback_response.status_code}"
+                )
+        except Exception as exc:
+            print(f"❌ [MediaMTX] Delete failed for camera {cam_id}: {exc}")
 
     def bootstrap_cameras_from_db(self):
         if not self.db_available:
@@ -224,6 +296,7 @@ class IngestionService:
                         # explicit delete operation in payload
                         if op and op.startswith("delete"):
                             print(f"🔔 [Realtime] Handling delete operation for camera {cam_id}")
+                            self._delete_mediamtx_path(cam_id)
                             self._handle_delete(cam_id)
                             continue
 
@@ -238,6 +311,7 @@ class IngestionService:
 
                         # Update in-memory state and ensure a stream thread exists
                         self._update_camera_config_from_row(cam_id, camera_row)
+                        self._upsert_mediamtx_path(cam_id, camera_row)
                         self._ensure_stream_thread(cam_id)
         except Exception as exc:
             print(f"❌ [Realtime] Database listener failed: {exc}. Running on default config.")
