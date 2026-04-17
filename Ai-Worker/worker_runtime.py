@@ -97,13 +97,32 @@ class WorkerRuntime:
     def _next_batch():
         return {cam_id: q.get() for cam_id, q in list(frame_queues.items()) if not q.empty()}
 
+    @staticmethod
+    def _is_detection_enabled(cam_id):
+        cam_cfg = CAMERA_CONFIG.get(cam_id, {})
+        # Prefer the DB-driven `detection` flag. Fall back to `is_active` for compatibility.
+        return bool(cam_cfg.get("detection", cam_cfg.get("is_active", True)))
+
     def _run_plugins(self, scene_state):
+        enabled_scene_state = {
+            cam_id: state for cam_id, state in scene_state.items() if self._is_detection_enabled(cam_id)
+        }
+        if not enabled_scene_state:
+            return
+
         for plugin in self.plugins:
             if isinstance(plugin, TusslePlugin):
-                tussle_input = {cam_id: state["raw_frame"] for cam_id, state in scene_state.items()}
+                # Tussle plugin keeps per-camera state; guard against unknown cameras.
+                tussle_input = {
+                    cam_id: state["raw_frame"]
+                    for cam_id, state in enabled_scene_state.items()
+                    if cam_id in getattr(plugin, "frame_buffers", {})
+                }
+                if not tussle_input:
+                    continue
                 alerts = plugin.process_batch(tussle_input)
             else:
-                alerts = plugin.process_batch(scene_state)
+                alerts = plugin.process_batch(enabled_scene_state)
 
             for alert in alerts:
                 trigger_cam = alert["cameraId"]
@@ -112,10 +131,10 @@ class WorkerRuntime:
                     key = (trigger_cam, alert["trackId"])
                     self.fall_persist[key] = time.time()
 
-                if trigger_cam not in scene_state:
+                if trigger_cam not in enabled_scene_state:
                     continue
 
-                trigger_frame = scene_state[trigger_cam]["raw_frame"]
+                trigger_frame = enabled_scene_state[trigger_cam]["raw_frame"]
                 timestamp = int(time.time())
                 video_path = self.recorder.trigger(trigger_cam, alert["eventType"], timestamp)
 
