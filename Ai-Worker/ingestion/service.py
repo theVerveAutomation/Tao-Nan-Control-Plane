@@ -115,13 +115,17 @@ class IngestionService:
 
             # join and remove thread reference
             thread = self.camera_threads.pop(cam_id, None)
-            self.stop_events.pop(cam_id, None)
+            # remove stored stream URL for this camera (avoid stale entries)
+            self.thread_stream_url.pop(cam_id, None)
 
         if thread is not None:
             try:
                 thread.join(timeout=1.0)
             except Exception:
                 pass
+
+        with self.state_lock:
+            self.stop_events.pop(cam_id, None)
 
     def _update_camera_config_from_row(self, cam_id, camera_row):
         if not camera_row:
@@ -187,7 +191,7 @@ class IngestionService:
             ev = threading.Event()
             self.stop_events[cam_id] = ev
 
-            t = threading.Thread(target=self.capture_stream, args=(cam_id, stream_url), daemon=True)
+            t = threading.Thread(target=self.capture_stream, args=(cam_id, stream_url, ev), daemon=True)
             t.start()
             self.camera_threads[cam_id] = t
             self.thread_stream_url[cam_id] = stream_url
@@ -238,7 +242,7 @@ class IngestionService:
         except Exception as exc:
             print(f"❌ [Realtime] Database listener failed: {exc}. Running on default config.")
 
-    def capture_stream(self, cam_id, stream_url):
+    def capture_stream(self, cam_id, stream_url, stop_event):
         reconnect_delay = STREAM_RECONNECT_DELAY_SECONDS
         max_read_failures = STREAM_MAX_READ_FAILURES
         dev_target_fps = DEV_TARGET_FPS
@@ -246,8 +250,7 @@ class IngestionService:
 
         while True:
             # stop event requested?
-            ev = self.stop_events.get(cam_id)
-            if ev is not None and ev.is_set():
+            if stop_event.is_set():
                 print(f"[{cam_id}] ⛔ Stop requested. Exiting capture loop.")
                 return
             print(f"[{cam_id}] Connecting to stream...")
@@ -264,8 +267,7 @@ class IngestionService:
 
             while cap.isOpened():
                 # check stop event frequently so we can exit quickly when asked
-                ev = self.stop_events.get(cam_id)
-                if ev is not None and ev.is_set():
+                if stop_event.is_set():
                     print(f"[{cam_id}] ⛔ Stop requested while reading. Releasing capture and exiting.")
                     try:
                         cap.release()
@@ -338,7 +340,7 @@ class IngestionService:
             ev = threading.Event()
             self.stop_events[cam_id] = ev
 
-            t = threading.Thread(target=self.capture_stream, args=(cam_id, stream_url), daemon=True)
+            t = threading.Thread(target=self.capture_stream, args=(cam_id, stream_url, ev), daemon=True)
             t.start()
             threads.append(t)
             self.camera_threads[cam_id] = t

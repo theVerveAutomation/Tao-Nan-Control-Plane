@@ -47,6 +47,21 @@ STREAM_RECONNECT_DELAY_SECONDS = float(os.environ.get("STREAM_RECONNECT_DELAY_SE
 STREAM_MAX_READ_FAILURES = int(os.environ.get("STREAM_MAX_READ_FAILURES", "30"))
 DEV_TARGET_FPS = float(os.environ.get("DEV_TARGET_FPS", "30"))
 
+ENABLE_RTMP_PUBLISH = os.environ.get("ENABLE_RTMP_PUBLISH", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+RTMP_BASE_URL = os.environ.get("RTMP_BASE_URL", "rtmp://localhost:1935/live")
+RTMP_STREAM_PREFIX = os.environ.get("RTMP_STREAM_PREFIX", "cam_")
+RTMP_PUBLISH_FPS = int(os.environ.get("RTMP_PUBLISH_FPS", "10"))
+RTMP_FRAME_WIDTH = int(os.environ.get("RTMP_FRAME_WIDTH", "640"))
+RTMP_FRAME_HEIGHT = int(os.environ.get("RTMP_FRAME_HEIGHT", "360"))
+RTMP_FFMPEG_BIN = os.environ.get("RTMP_FFMPEG_BIN", "ffmpeg")
+RTMP_VIDEO_CODEC = os.environ.get("RTMP_VIDEO_CODEC", "libx264")
+RTMP_FFMPEG_PRESET = os.environ.get("RTMP_FFMPEG_PRESET", "veryfast")
+
 
 def get_default_camera_config():
     return deepcopy(DEFAULT_CAMERA_CONFIG)

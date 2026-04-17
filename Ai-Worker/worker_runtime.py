@@ -7,18 +7,27 @@ from config import (
     CLIP_RECORDER_AFTER_FRAMES,
     CLIP_RECORDER_BEFORE_FRAMES,
     CLIP_RECORDER_FPS,
+    ENABLE_RTMP_PUBLISH,
     ENABLE_FALL_PLUGIN,
     ENABLE_TUSSLE_PLUGIN,
     ENV,
+    RTMP_BASE_URL,
+    RTMP_FFMPEG_BIN,
+    RTMP_FFMPEG_PRESET,
+    RTMP_FRAME_HEIGHT,
+    RTMP_FRAME_WIDTH,
+    RTMP_PUBLISH_FPS,
+    RTMP_STREAM_PREFIX,
+    RTMP_VIDEO_CODEC,
     TUSSLE_MODEL_PATH,
 )
 from ingestion_funnel import CAMERA_CONFIG, frame_queues, get_ingestion_service, start_funnel
 from plugins.tussle_slowfast import TusslePlugin
 from plugins.fall_rule_based import RuleBasedFallPlugin
+from rtmp_publisher import RtmpPublisherHub, ffmpeg_exists
 from video_recorder import ClipRecorder
 from worker_alerting import AlertDispatcher
 from worker_backbone import SharedBackbone
-from worker_display import display_loop
 
 
 class WorkerRuntime:
@@ -28,6 +37,7 @@ class WorkerRuntime:
         self.display_lock = threading.Lock()
         self.display_frames = {}
         self.display_thread = None
+        self.opened_windows = set()
 
         self.camera_ids = list(CAMERA_CONFIG.keys())
         self.backbone = None
@@ -35,6 +45,17 @@ class WorkerRuntime:
         self.recorder = None
         self.alert_dispatcher = AlertDispatcher()
         self.fall_persist = {}
+        self.rtmp_hub = RtmpPublisherHub(
+            enabled=ENABLE_RTMP_PUBLISH,
+            base_url=RTMP_BASE_URL,
+            stream_prefix=RTMP_STREAM_PREFIX,
+            fps=RTMP_PUBLISH_FPS,
+            width=RTMP_FRAME_WIDTH,
+            height=RTMP_FRAME_HEIGHT,
+            ffmpeg_bin=RTMP_FFMPEG_BIN,
+            video_codec=RTMP_VIDEO_CODEC,
+            preset=RTMP_FFMPEG_PRESET,
+        )
 
     def setup(self):
         start_funnel()
@@ -44,14 +65,19 @@ class WorkerRuntime:
 
         self.backbone = SharedBackbone()
 
-        if self.env == "development":
+        # Only enable local OpenCV preview when in development *and* RTMP publishing is disabled.
+        if self.env == "development" and not ENABLE_RTMP_PUBLISH:
             self.display_frames = {cam_id: None for cam_id in self.camera_ids}
-            self.display_thread = threading.Thread(
-                target=display_loop,
-                args=(self.stop_event, self.display_frames, self.display_lock),
-                daemon=True,
-            )
-            self.display_thread.start()
+            print("[Display] Running display rendering on main runtime thread.")
+
+        if ENABLE_RTMP_PUBLISH:
+            if ffmpeg_exists(RTMP_FFMPEG_BIN):
+                print(f"[RTMP] Publisher enabled. Base URL: {RTMP_BASE_URL}")
+            else:
+                print(
+                    f"[RTMP] WARNING: ffmpeg binary '{RTMP_FFMPEG_BIN}' not found. "
+                    "RTMP publishing is enabled but will fail until ffmpeg is installed/available."
+                )
 
         print("🔌 Loading AI Plugins...")
         self.plugins = []
@@ -133,7 +159,8 @@ class WorkerRuntime:
                 )
 
     def _publish_display_frames(self, scene_state):
-        if self.env != "development":
+        # Skip local display when not in development or when RTMP publishing is active
+        if self.env != "development" or ENABLE_RTMP_PUBLISH:
             return
 
         with self.display_lock:
@@ -169,6 +196,62 @@ class WorkerRuntime:
                     if updated_plugins:
                         print(f"🔧 [Runtime] Updated plugins for new camera {cam_id}: {', '.join(updated_plugins)}")
 
+    def _publish_rtmp_streams(self, scene_state):
+        if not ENABLE_RTMP_PUBLISH:
+            return
+
+        for cam_id, state in scene_state.items():
+            frame = state.get("raw_frame")
+            if frame is None:
+                continue
+            self.rtmp_hub.publish_frame(cam_id, frame)
+
+        self.rtmp_hub.prune_removed_cameras(CAMERA_CONFIG.keys())
+
+    def _render_display_windows(self):
+        # Skip local window rendering when not in development or when RTMP publishing is active
+        if self.env != "development" or ENABLE_RTMP_PUBLISH:
+            return
+
+        with self.display_lock:
+            items = list(self.display_frames.items())
+
+        for cam_id, frame in items:
+            if frame is None:
+                continue
+
+            window_name = f"Tracked Output {cam_id}"
+            if cam_id not in self.opened_windows:
+                try:
+                    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                    self.opened_windows.add(cam_id)
+                    print(f"[Display] Opening window for camera {cam_id}")
+                except Exception as exc:
+                    print(f"[Display] Failed to create window for camera {cam_id}: {exc}")
+                    continue
+
+            try:
+                cv2.imshow(window_name, frame)
+            except Exception as exc:
+                print(f"[Display] Failed to render frame for camera {cam_id}: {exc}")
+
+        current_ids = set(CAMERA_CONFIG.keys())
+        to_close = set(self.opened_windows) - current_ids
+        if to_close:
+            with self.display_lock:
+                for cid in to_close:
+                    try:
+                        cv2.destroyWindow(f"Tracked Output {cid}")
+                    except Exception:
+                        pass
+                    self.opened_windows.discard(cid)
+                    self.display_frames.pop(cid, None)
+                    print(f"[Display] Closed window for removed camera {cid}")
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            print("[Display] Window closed by user.")
+            self.stop_event.set()
+
     def run(self):
         self.setup()
 
@@ -188,12 +271,15 @@ class WorkerRuntime:
 
                 self._run_plugins(scene_state)
                 self._annotate_frames(scene_state)
+                self._publish_rtmp_streams(scene_state)
                 self._publish_display_frames(scene_state)
+                self._render_display_windows()
 
         except KeyboardInterrupt:
             print("\n🛑 Shutting down system...")
         finally:
             self.stop_event.set()
+            self.rtmp_hub.stop_all()
             if self.display_thread is not None and self.display_thread.is_alive():
                 self.display_thread.join(timeout=1.0)
             cv2.destroyAllWindows()
