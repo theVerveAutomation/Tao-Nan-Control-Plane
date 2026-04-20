@@ -36,6 +36,13 @@ class FFmpegRtmpPublisher:
 
         self._process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._last_stderr_log_ts = 0.0
+        # restart throttling
+        self._restart_count = 0
+        self._restart_window_start = 0.0
+        self._max_restarts = 5
+        self._restart_window_seconds = 60
 
     def _build_command(self):
         # Raw BGR frames from stdin -> H264 -> RTMP/FLV
@@ -72,19 +79,62 @@ class FFmpegRtmpPublisher:
         if self._process is not None and self._process.poll() is None:
             return True
 
+        # throttle excessive restart attempts within a window
+        now = time.time()
+        if self._restart_window_start == 0.0:
+            self._restart_window_start = now
+
+        if now - self._restart_window_start > self._restart_window_seconds:
+            # window expired: reset counter
+            self._restart_window_start = now
+            self._restart_count = 0
+
+        if self._restart_count >= self._max_restarts:
+            if now - self._restart_window_start <= self._restart_window_seconds:
+                if now - self._last_stderr_log_ts > 5:
+                    print(f"[RTMP] Suppressing restarts for {self.camera_id} (>{self._max_restarts} restarts in {self._restart_window_seconds}s)")
+                    self._last_stderr_log_ts = now
+                return False
+
         command = self._build_command()
         try:
             self._process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
+            # start a small thread to drain stderr so ffmpeg errors are visible
+            def _drain_stderr(proc, cam_id):
+                try:
+                    if proc.stderr is None:
+                        return
+                    for raw in proc.stderr:
+                        try:
+                            line = raw.decode(errors="ignore").strip()
+                        except Exception:
+                            line = str(raw)
+                        if line:
+                            now2 = time.time()
+                            # avoid flooding logs
+                            if now2 - self._last_stderr_log_ts > 0.5:
+                                print(f"[RTMP][ffmpeg:{cam_id}] {line}")
+                                self._last_stderr_log_ts = now2
+                except Exception:
+                    pass
+
+            self._stderr_thread = threading.Thread(target=_drain_stderr, args=(self._process, self.camera_id), daemon=True)
+            self._stderr_thread.start()
+
             print(f"[RTMP] Started ffmpeg publisher for {self.camera_id} -> {self.output_url}")
+            # successful start: reset restart counters
+            self._restart_count = 0
+            self._restart_window_start = now
             return True
         except Exception as exc:
             print(f"[RTMP] Failed to start ffmpeg for {self.camera_id}: {exc}")
             self._process = None
+            self._restart_count += 1
             return False
 
     def publish(self, frame):
@@ -107,10 +157,14 @@ class FFmpegRtmpPublisher:
                 if self._process is None or self._process.stdin is None:
                     return
 
-                self._process.stdin.write(frame.tobytes())
-            except (BrokenPipeError, OSError) as exc:
-                print(f"[RTMP] Publisher pipe error for {self.camera_id}: {exc}. Restarting next frame.")
-                self.stop()
+                try:
+                    self._process.stdin.write(frame.tobytes())
+                except (BrokenPipeError, OSError) as exc:
+                    print(f"[RTMP] Publisher pipe error for {self.camera_id}: {exc}. Restarting next frame.")
+                    # stop the current process and increment restart counter
+                    self.stop()
+                    self._restart_count += 1
+                    return
             except Exception as exc:
                 print(f"[RTMP] Failed to publish frame for {self.camera_id}: {exc}")
 
@@ -138,6 +192,14 @@ class FFmpegRtmpPublisher:
                     pass
 
             print(f"[RTMP] Stopped publisher for {self.camera_id}")
+
+            # ensure stderr thread stops
+            try:
+                if self._stderr_thread and self._stderr_thread.is_alive():
+                    # thread will exit when proc.stderr closes
+                    self._stderr_thread = None
+            except Exception:
+                pass
 
 
 class RtmpPublisherHub:

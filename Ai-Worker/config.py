@@ -47,7 +47,7 @@ STREAM_RECONNECT_DELAY_SECONDS = float(os.environ.get("STREAM_RECONNECT_DELAY_SE
 STREAM_MAX_READ_FAILURES = int(os.environ.get("STREAM_MAX_READ_FAILURES", "30"))
 DEV_TARGET_FPS = float(os.environ.get("DEV_TARGET_FPS", "30"))
 
-ENABLE_RTMP_PUBLISH = os.environ.get("ENABLE_RTMP_PUBLISH", "false").lower() in {
+ENABLE_RTMP_PUBLISH = os.environ.get("ENABLE_RTMP_PUBLISH", "true").lower() in {
     "1",
     "true",
     "yes",
