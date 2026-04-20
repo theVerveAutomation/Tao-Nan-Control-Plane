@@ -23,7 +23,8 @@ DEFAULT_CAMERA_CONFIG = {
 YOLO_MODEL_PATH = os.environ.get("YOLO_MODEL_PATH", "yolov8n-pose.pt")
 TUSSLE_MODEL_PATH = os.environ.get("TUSSLE_MODEL_PATH", "./best_slowfast_fight_model (2).pth")
 
-ENABLE_TUSSLE_PLUGIN = os.environ.get("ENABLE_TUSSLE_PLUGIN", "false").lower() in {
+ENABLE_TUSSLE_PLUGIN = os.environ.get("ENABLE_TUSSLE_PLUGIN", "false" \
+"").lower() in {
     "1",
     "true",
     "yes",

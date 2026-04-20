@@ -8,8 +8,6 @@ from config import (
     CLIP_RECORDER_BEFORE_FRAMES,
     CLIP_RECORDER_FPS,
     ENABLE_RTMP_PUBLISH,
-    ENABLE_FALL_PLUGIN,
-    ENABLE_TUSSLE_PLUGIN,
     ENV,
     RTMP_BASE_URL,
     RTMP_FFMPEG_BIN,
@@ -57,42 +55,6 @@ class WorkerRuntime:
             preset=RTMP_FFMPEG_PRESET,
         )
 
-    def setup(self):
-        start_funnel()
-
-        ingestion_service = get_ingestion_service()
-        self.camera_ids = list(ingestion_service.camera_config.keys())
-
-        self.backbone = SharedBackbone()
-
-        # Only enable local OpenCV preview when in development *and* RTMP publishing is disabled.
-        if self.env == "development" and not ENABLE_RTMP_PUBLISH:
-            self.display_frames = {cam_id: None for cam_id in self.camera_ids}
-            print("[Display] Running display rendering on main runtime thread.")
-
-        if ENABLE_RTMP_PUBLISH:
-            if ffmpeg_exists(RTMP_FFMPEG_BIN):
-                print(f"[RTMP] Publisher enabled. Base URL: {RTMP_BASE_URL}")
-            else:
-                print(
-                    f"[RTMP] WARNING: ffmpeg binary '{RTMP_FFMPEG_BIN}' not found. "
-                    "RTMP publishing is enabled but will fail until ffmpeg is installed/available."
-                )
-
-        print("🔌 Loading AI Plugins...")
-        self.plugins = []
-        if ENABLE_TUSSLE_PLUGIN:
-            self.plugins.append(TusslePlugin(model_path=TUSSLE_MODEL_PATH, camera_ids=self.camera_ids))
-        if ENABLE_FALL_PLUGIN:
-            self.plugins.append(RuleBasedFallPlugin())
-
-        self.recorder = ClipRecorder(
-            before_frames=CLIP_RECORDER_BEFORE_FRAMES,
-            after_frames=CLIP_RECORDER_AFTER_FRAMES,
-            fps=CLIP_RECORDER_FPS,
-        )
-        print("🚀 Master Loop Online. Analyzing streams...")
-
     @staticmethod
     def _next_batch():
         return {cam_id: q.get() for cam_id, q in list(frame_queues.items()) if not q.empty()}
@@ -100,8 +62,11 @@ class WorkerRuntime:
     @staticmethod
     def _is_detection_enabled(cam_id):
         cam_cfg = CAMERA_CONFIG.get(cam_id, {})
-        # Prefer the DB-driven `detection` flag. Fall back to `is_active` for compatibility.
-        return bool(cam_cfg.get("detection", cam_cfg.get("is_active", True)))
+        # Prefer the DB-driven `detections` flag (newer name). Fall back to
+        # `detection` for backward compatibility, then `is_active`.
+        return bool(
+            cam_cfg.get("detections", cam_cfg.get("detection", cam_cfg.get("is_active", True)))
+        )
 
     def _run_plugins(self, scene_state):
         enabled_scene_state = {
@@ -197,6 +162,11 @@ class WorkerRuntime:
                     updated_plugins = []
                     # Update plugins that track camera_ids (best-effort) and try reinitialization
                     for plugin in self.plugins:
+                        # Only add runtime-introduced cameras to plugins if
+                        # detections are enabled for that camera.
+                        if not self._is_detection_enabled(cam_id):
+                            continue
+
                         if hasattr(plugin, "camera_ids") and isinstance(plugin.camera_ids, list):
                             if cam_id not in plugin.camera_ids:
                                 plugin.camera_ids.append(cam_id)
@@ -302,3 +272,52 @@ class WorkerRuntime:
             if self.display_thread is not None and self.display_thread.is_alive():
                 self.display_thread.join(timeout=1.0)
             cv2.destroyAllWindows()
+
+    def setup(self):
+        start_funnel()
+
+        ingestion_service = get_ingestion_service()
+        self.camera_ids = list(ingestion_service.camera_config.keys())
+
+        self.backbone = SharedBackbone()
+
+        # Only enable local OpenCV preview when in development *and* RTMP publishing is disabled.
+        if self.env == "development" and not ENABLE_RTMP_PUBLISH:
+            self.display_frames = {cam_id: None for cam_id in self.camera_ids}
+            print("[Display] Running display rendering on main runtime thread.")
+
+        if ENABLE_RTMP_PUBLISH:
+            if ffmpeg_exists(RTMP_FFMPEG_BIN):
+                print(f"[RTMP] Publisher enabled. Base URL: {RTMP_BASE_URL}")
+            else:
+                print(
+                    f"[RTMP] WARNING: ffmpeg binary '{RTMP_FFMPEG_BIN}' not found. "
+                    "RTMP publishing is enabled but will fail until ffmpeg is installed/available."
+                )
+
+        print("🔌 Loading AI Plugins (controlled by camera_config.detections)...")
+        self.plugins = []
+
+        # Determine which cameras have detections enabled and pass that list
+        # to plugins that accept per-camera configuration.
+        detection_enabled_cams = [cam for cam in self.camera_ids if self._is_detection_enabled(cam)]
+
+        try:
+            self.plugins.append(TusslePlugin(model_path=TUSSLE_MODEL_PATH, camera_ids=detection_enabled_cams))
+        except Exception as exc:
+            print(f"⚠️ [Plugins] Failed to initialize TusslePlugin: {exc}")
+
+        try:
+            # Rule-based fall plugin processes the scene_state passed by runtime,
+            # and runtime will filter out cameras without detections before calling plugins.
+            self.plugins.append(RuleBasedFallPlugin())
+        except Exception as exc:
+            print(f"⚠️ [Plugins] Failed to initialize RuleBasedFallPlugin: {exc}")
+
+        self.recorder = ClipRecorder(
+            before_frames=CLIP_RECORDER_BEFORE_FRAMES,
+            after_frames=CLIP_RECORDER_AFTER_FRAMES,
+            fps=CLIP_RECORDER_FPS,
+        )
+        print("🚀 Master Loop Online. Analyzing streams...")
+

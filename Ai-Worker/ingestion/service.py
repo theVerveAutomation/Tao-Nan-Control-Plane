@@ -160,7 +160,8 @@ class IngestionService:
                         op = None
                     break
 
-            cam_id = payload.get("data").get("id")
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else None
+            cam_id = (data or {}).get("id") or payload.get("id")
         else:
             cam_id = str(payload)
 
@@ -302,10 +303,12 @@ class IngestionService:
 
                         # Obtain camera row from payload or DB (fallback)
                         if isinstance(payload, dict):
-                            camera_row = payload.get('data')
+                            payload_data = payload.get("data") if isinstance(payload.get("data"), dict) else None
+                            camera_row = payload_data or payload
                         else:
                             camera_row = self.repository.fetch_camera_by_id(cam_id)
                             if not camera_row:
+                                self._delete_mediamtx_path(cam_id)
                                 self._handle_delete(cam_id)
                                 continue
 
