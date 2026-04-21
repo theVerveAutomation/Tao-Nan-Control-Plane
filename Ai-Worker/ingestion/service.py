@@ -44,7 +44,7 @@ class IngestionService:
     @staticmethod
     def _mediamtx_path_name(cam_id):
         safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(cam_id))
-        return f"live/cam_{safe_id}"
+        return f"cam_{safe_id}"
 
     def _mediamtx_available(self) -> bool:
         """Quick health-check to avoid noisy 404/connection attempts during bootstrap."""
