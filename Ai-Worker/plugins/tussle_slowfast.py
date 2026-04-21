@@ -10,9 +10,17 @@ class TusslePlugin:
         print("🔌 Initializing Tussle (SlowFast) Plugin...")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # --- Config from your Kaggle script ---
-        self.CONFIDENCE_THRESHOLD = 0.55
-        self.SUSTAINED_THRESHOLD = 3
+        # --- SEVERITY MATRIX ---
+        # Scaling both Confidence and Sustained counts together
+        self.SEVERITY_THRESHOLDS = {
+            "CRITICAL": {"conf": 0.85, "sustained": 4},
+            "HIGH":     {"conf": 0.75, "sustained": 3},
+            "MEDIUM":   {"conf": 0.65, "sustained": 2},
+            "LOW":      {"conf": 0.55, "sustained": 1}
+        }
+        
+        # The lowest baseline needed to even start the suspicious counter
+        self.BASE_CONF_THRESHOLD = self.SEVERITY_THRESHOLDS["LOW"]["conf"]
         self.INFERENCE_INTERVAL = 15 # Run every 15 frames
         
         # --- Load Model ---
@@ -36,42 +44,47 @@ class TusslePlugin:
         self.suspicious_counts = {cam: 0 for cam in camera_ids}
         self.frame_counters = {cam: 0 for cam in camera_ids}
 
+    def _determine_severity(self, smoothed_score, count):
+        """
+        Checks the ladder from top to bottom. Returns the highest valid severity.
+        """
+        if smoothed_score >= self.SEVERITY_THRESHOLDS["CRITICAL"]["conf"] and count >= self.SEVERITY_THRESHOLDS["CRITICAL"]["sustained"]:
+            return "CRITICAL"
+        elif smoothed_score >= self.SEVERITY_THRESHOLDS["HIGH"]["conf"] and count >= self.SEVERITY_THRESHOLDS["HIGH"]["sustained"]:
+            return "HIGH"
+        elif smoothed_score >= self.SEVERITY_THRESHOLDS["MEDIUM"]["conf"] and count >= self.SEVERITY_THRESHOLDS["MEDIUM"]["sustained"]:
+            return "MEDIUM"
+        elif smoothed_score >= self.SEVERITY_THRESHOLDS["LOW"]["conf"] and count >= self.SEVERITY_THRESHOLDS["LOW"]["sustained"]:
+            return "LOW"
+            
+        return None
+
     def process_batch(self, batched_frames_dict):
-        """
-        Takes a dictionary of {cam_id: latest_rgb_frame} from the main loop.
-        Returns a list of alerts if a tussle is detected.
-        """
         alerts = []
         cams_ready_for_inference = []
         fast_tensors = []
         slow_tensors = []
-        #print(f"[TusslePlugin][DEBUG] Received batch: {list(batched_frames_dict.keys())}")
 
         # 1. Update buffers for all cameras
         for cam_id, frame in batched_frames_dict.items():
             #print(f"[TusslePlugin][DEBUG] cam_id={cam_id} frame type={type(frame)} shape={getattr(frame, 'shape', None)}")
             if frame is None:
-                print(f"[TusslePlugin][DEBUG] cam_id={cam_id} received None frame, skipping.")
                 continue
-            # Preprocess to 224x224 RGB as your script requires
+            
             import numpy as np
-            if frame is None or not isinstance(frame, np.ndarray):
-                print(f"[TusslePlugin][DEBUG] cam_id={cam_id} invalid frame (not ndarray), skipping batch.")
-                return []
+            if not isinstance(frame, np.ndarray):
+                continue
+                
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             resized = cv2.resize(rgb_frame, (224, 224))
             self.frame_buffers[cam_id].append(resized)
-            #print(f"[TusslePlugin][DEBUG] cam_id={cam_id} buffer size={len(self.frame_buffers[cam_id])}")
             self.frame_counters[cam_id] += 1
-            # Check if this camera is ready for inference
+            
             if len(self.frame_buffers[cam_id]) == 64 and self.frame_counters[cam_id] % self.INFERENCE_INTERVAL == 0:
-                print(f"[TusslePlugin][DEBUG] Inference triggered for cam_id={cam_id} at frame_counter={self.frame_counters[cam_id]}")
                 cams_ready_for_inference.append(cam_id)
-                # Extract Fast/Slow pathways
                 clip = np.array(self.frame_buffers[cam_id])
                 fast = clip[::2][:32]
                 slow = fast[::4][:8]
-                # Format for PyTorch (C, T, H, W)
                 fast_t = torch.from_numpy(fast).permute(3, 0, 1, 2).float() / 255.0
                 slow_t = torch.from_numpy(slow).permute(3, 0, 1, 2).float() / 255.0
                 fast_tensors.append(fast_t)
@@ -79,8 +92,6 @@ class TusslePlugin:
 
         # 2. Run Batched Inference
         if len(cams_ready_for_inference) > 0:
-            #print(f"[TusslePlugin][DEBUG] Running inference for cams: {cams_ready_for_inference}")
-            # Stack into (Batch, C, T, H, W)
             batch_fast = torch.stack(fast_tensors).to(self.device)
             batch_slow = torch.stack(slow_tensors).to(self.device)
 
@@ -88,33 +99,35 @@ class TusslePlugin:
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
                     preds = self.model([batch_slow, batch_fast])
                     probabilities = torch.softmax(preds, dim=1)
-            # 3. Apply your Grace Period Logic
+                    
+            # 3. Apply Dynamic Severity Ladder
             for idx, cam_id in enumerate(cams_ready_for_inference):
                 fight_score = probabilities[idx][1].item()
-                print(f"[TusslePlugin][DEBUG] cam_id={cam_id} fight_score={fight_score:.4f}")
                 self.prediction_history[cam_id].append(fight_score)
 
                 if len(self.prediction_history[cam_id]) == 5:
                     smoothed_score = sum(self.prediction_history[cam_id]) / 5.0
-                    print(f"[TusslePlugin][DEBUG] cam_id={cam_id} smoothed_score={smoothed_score:.4f} suspicious_count={self.suspicious_counts[cam_id]}")
-                    # --- YOUR EXACT GRACE PERIOD LOGIC ---
-                    if smoothed_score >= self.CONFIDENCE_THRESHOLD:
-                        #print(f"[TusslePlugin][DEBUG] cam_id={cam_id} smoothed_score above threshold, incrementing suspicious_count.")
+                    
+                    # Increment counter if we meet the absolute minimum baseline (LOW threshold)
+                    if smoothed_score >= self.BASE_CONF_THRESHOLD:
                         self.suspicious_counts[cam_id] += 1
                     else:
                         if self.suspicious_counts[cam_id] > 0:
-                            #print(f"[TusslePlugin][DEBUG] cam_id={cam_id} smoothed_score below threshold, decrementing suspicious_count.")
                             self.suspicious_counts[cam_id] -= 1 
 
-                    # Trigger Alarm
-                    if self.suspicious_counts[cam_id] >= self.SUSTAINED_THRESHOLD:
-                        #print(f"⚠️  Tussle detected on {cam_id} with smoothed confidence {smoothed_score:.2f}")
+                    # Determine severity using the matrix
+                    severity = self._determine_severity(smoothed_score, self.suspicious_counts[cam_id])
+
+                    if severity:
+                        print(f"⚠️ [{cam_id}] TUSSLE DETECTED! Severity: {severity} | Conf: {smoothed_score:.2f} | Count: {self.suspicious_counts[cam_id]}")
                         alerts.append({
                             "cameraId": cam_id,
                             "eventType": "tussle",
-                            "confidence": smoothed_score
+                            "confidence": smoothed_score,
+                            "severity": severity
                         })
-                        # Debounce
+                        
+                        # Once triggered, reset the state so we don't spam the database
                         self.suspicious_counts[cam_id] = 0
                         self.prediction_history[cam_id].clear()
 
