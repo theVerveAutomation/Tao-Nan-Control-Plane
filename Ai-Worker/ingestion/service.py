@@ -44,7 +44,7 @@ class IngestionService:
     @staticmethod
     def _mediamtx_path_name(cam_id):
         safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(cam_id))
-        return f"cam_{safe_id}"
+        return f"live/cam_{safe_id}"
 
     def _mediamtx_available(self) -> bool:
         """Quick health-check to avoid noisy 404/connection attempts during bootstrap."""
@@ -89,7 +89,6 @@ class IngestionService:
         except Exception:
             media_source = source_url
 
-        print(f"🔁 Upserting MediaMTX path for camera {cam_id}: {path_name} -> {media_source} (sourceOnDemand=true)")
         payload = {
             "name": path_name,
             "source": media_source,
@@ -98,7 +97,7 @@ class IngestionService:
 
         # Primary call follows requested endpoint shape; fallback supports path-name URL styles.
         try:
-            response = requests.post(f"{self.mediamtx_base_url}/v3/config/paths/add/{path_name}", json=payload, timeout=3)
+            response = requests.post(f"{self.mediamtx_base_url}/v3/config/paths/add/{path_name}", json=payload, timeout=5)
             if response.status_code not in (200, 201, 204):
                 print(
                     f"⚠️ [MediaMTX] Failed to upsert path {path_name}. "
@@ -203,6 +202,7 @@ class IngestionService:
         """In development, if the camera source is a local file, start ffmpeg to push it to the RTMP target."""
         if self.env != "development":
             return
+
         source = camera_row.get("stream_url") or camera_row.get("url") or camera_row.get("file")
         if not source:
             return
@@ -212,14 +212,12 @@ class IngestionService:
             source_path = source[7:]
         else:
             source_path = source
-
         # Determine whether this is a local file or a network stream
         is_file = isinstance(source_path, str) and os.path.exists(source_path)
 
         # build RTMP target using RTMP_BASE_URL_LIVE and mediamtx path name
         path_name = self._mediamtx_path_name(cam_id)
         target = f"{RTMP_BASE_URL_LIVE.rstrip('/')}/{path_name}"
-
         # already running
         if cam_id in self.file_stream_procs:
             return
@@ -302,20 +300,13 @@ class IngestionService:
 
         # Register camera streams with MediaMTX so they appear as on-demand paths
         if self._mediamtx_available():
-            print(f"✅ [MediaMTX] Available at {self.mediamtx_base_url}. Upserting paths for existing cameras...")
             for cam_id, cam_row in list(self.camera_config.items()):
                 try:
-                    # In development, optionally start ffmpeg streaming local files
-                    try:
-                        self._start_file_stream_if_dev(cam_id, cam_row)
-                    except Exception:
-                        pass
-
                     self._upsert_mediamtx_path(cam_id, cam_row)
 
                     # health-check stream compatibility (ffprobe)
                     try:
-                        self._ffprobe_health_check(cam_id, media_source if 'media_source' in locals() else (cam_row.get('stream_url') or cam_row.get('url')))
+                        self._ffprobe_health_check(cam_id, (cam_row.get('stream_url') or cam_row.get('url')))
                     except Exception:
                         pass
                 except Exception as exc:
