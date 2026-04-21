@@ -7,16 +7,21 @@ import numpy as np
 # ── Fall Severity Levels ───────────────────────────────────────────────────────
 class FallSeverity:
     """
-    HIGH   – Fall confirmed: descent + impact + ground confirmation all satisfied.
-              Alert is fired, cooldown starts.
-    MEDIUM – Fall in progress: descent frames threshold met, OR impact latched but
-              ground confirmation not yet accumulated enough.
-    LOW    – No fall detected: below-threshold movement, exercise/seated suppression,
-              baseline not locked, or a guard (ghost/edge/area) rejected the detection.
+    CRITICAL – Person has been on the ground for an extended time (≥3s) with no
+               recovery. May be unconscious or unable to get up. Immediate response
+               required. Escalated from HIGH if ground dwell time keeps accumulating
+               past CRITICAL_GROUND_TIME after the alert fired.
+    HIGH     – Fall confirmed: descent + impact + ground confirmation all satisfied.
+               Alert is fired, cooldown starts.
+    MEDIUM   – Fall in progress: descent frames threshold met, OR impact latched but
+               ground confirmation not yet accumulated enough.
+    LOW      – No fall detected: below-threshold movement, exercise/seated suppression,
+               baseline not locked, or a guard (ghost/edge/area) rejected the detection.
     """
-    HIGH   = "HIGH"
-    MEDIUM = "MEDIUM"
-    LOW    = "LOW"
+    CRITICAL = "CRITICAL"
+    HIGH     = "HIGH"
+    MEDIUM   = "MEDIUM"
+    LOW      = "LOW"
 
 
 class RuleBasedFallPlugin:
@@ -45,14 +50,15 @@ class RuleBasedFallPlugin:
         res_scale_sq      = res_scale ** 2
 
         # ── Timing / motion constants ──────────────────────────────────────
-        self.BASELINE_TIME       = 1.5
-        self.UPRIGHT_ANGLE       = 18
-        self.GROUND_CONFIRM_TIME = 0.5    # raised from 0.06 — requires ~12 frames of lying flat
-        self.MIN_DESCENT_FRAMES  = 3      # raised from 2 — filters single-frame velocity spikes
-        self.RECOVERY_COOLDOWN   = 5.0
-        self.INERTIA_TIME        = 0.6
-        self.KP_CONF_THRESH      = 0.30
-        self.STREAM_FPS          = 25.0
+        self.BASELINE_TIME        = 1.5
+        self.UPRIGHT_ANGLE        = 18
+        self.GROUND_CONFIRM_TIME  = 0.5    # raised from 0.06 — requires ~12 frames of lying flat
+        self.CRITICAL_GROUND_TIME = 3.0    # seconds on ground after HIGH alert → escalate to CRITICAL
+        self.MIN_DESCENT_FRAMES   = 3      # raised from 2 — filters single-frame velocity spikes
+        self.RECOVERY_COOLDOWN    = 5.0
+        self.INERTIA_TIME         = 0.6
+        self.KP_CONF_THRESH       = 0.30
+        self.STREAM_FPS           = 25.0
 
         # ── Velocity thresholds (scaled to actual resolution) ──────────────
         self.DESCENT_VEL_THRESH   = 90.0    * res_scale
@@ -105,6 +111,7 @@ class RuleBasedFallPlugin:
 
         self.last_seen     = {}
         self.last_alert_ts = {}
+        self.alert_time    = {}  # person_key -> timestamp when HIGH alert fired (for CRITICAL escalation)
 
         # ── Per-person severity tracking ───────────────────────────────────
         self.current_severity = {}   # person_key -> FallSeverity.*
@@ -265,23 +272,27 @@ class RuleBasedFallPlugin:
             self.all_drop_history.pop(k, None)
             self.falling_ids.discard(k)
             self.current_severity.pop(k, None)
+            self.alert_time.pop(k, None)
             self.last_seen.pop(k, None)
 
     def _compute_severity(self, person_key) -> str:
         """
         Derive fall severity for a person from current pipeline state.
 
-        HIGH   – impact was detected AND ground confirmation has accumulated
-                 enough dwell time (i.e., an alert was just fired or is
-                 about to fire on this frame).
-        MEDIUM – descent counter has reached the minimum threshold OR
-                 impact has been latched but ground confirmation is still
-                 accumulating.
-        LOW    – none of the above conditions are met.
+        CRITICAL – HIGH alert already fired AND person has remained on the ground
+                   for ≥ CRITICAL_GROUND_TIME seconds since the alert.
+        HIGH     – Impact latched AND ground confirmation accumulated.
+        MEDIUM   – Descent counter at threshold OR impact latched but ground not yet confirmed.
+        LOW      – None of the above.
         """
         descent_ok = self.descent_counter[person_key] >= self.MIN_DESCENT_FRAMES
         impact_ok  = self.impact_detected[person_key]
         ground_ok  = self.ground_confirm_accum[person_key] >= self.GROUND_CONFIRM_TIME
+
+        alert_ts = self.alert_time.get(person_key)
+        if alert_ts is not None:
+            if (time.time() - alert_ts) >= self.CRITICAL_GROUND_TIME:
+                return FallSeverity.CRITICAL
 
         if impact_ok and ground_ok:
             return FallSeverity.HIGH
@@ -549,6 +560,7 @@ class RuleBasedFallPlugin:
                                 self.impact_detected[person_key]      = False
                                 self.descent_counter[person_key]      = 0
                                 self.ground_confirm_accum[person_key] = 0.0
+                                self.alert_time.pop(person_key, None)
                                 self._debug(
                                     f"[FallPlugin] impact latch cleared (upright) "
                                     f"cam={cam_id} id={track_id}"
@@ -665,6 +677,7 @@ class RuleBasedFallPlugin:
                             f"[FallPlugin] stood up, impact cleared "
                             f"(ratio={body_ratio:.2f}) cam={cam_id} id={track_id}"
                         )
+                        self.alert_time.pop(person_key, None)
                         self.current_severity[person_key] = FallSeverity.LOW
                         continue
 
@@ -697,6 +710,7 @@ class RuleBasedFallPlugin:
                         if (now_ts - last_alert) >= self.RECOVERY_COOLDOWN:
                             severity = FallSeverity.HIGH
                             self.current_severity[person_key] = severity
+                            self.alert_time[person_key]       = now_ts  # start CRITICAL escalation clock
                             print(
                                 f"⚠️  Fall confirmed cam={cam_id} track={track_id} "
                                 f"severity={severity} "
@@ -718,6 +732,30 @@ class RuleBasedFallPlugin:
                         self.ground_confirm_accum[person_key] = 0.0
                         self.falling_ids.discard(person_key)
                         continue
+
+                # ── CRITICAL escalation: person still on ground ≥ CRITICAL_GROUND_TIME ──
+                alert_ts = self.alert_time.get(person_key)
+                if alert_ts is not None and not self.impact_detected[person_key]:
+                    time_on_ground = now_ts - alert_ts
+                    if time_on_ground >= self.CRITICAL_GROUND_TIME:
+                        # Only fire once per RECOVERY_COOLDOWN window
+                        last_crit = self.last_alert_ts.get(person_key, 0.0)
+                        if (now_ts - last_crit) >= self.RECOVERY_COOLDOWN:
+                            self.current_severity[person_key] = FallSeverity.CRITICAL
+                            print(
+                                f"🚨 CRITICAL fall cam={cam_id} track={track_id} "
+                                f"— on ground {time_on_ground:.1f}s "
+                                f"(conf={conf:.2f} ratio={body_ratio:.2f})",
+                                flush=True,
+                            )
+                            alerts.append({
+                                "cameraId":   cam_id,
+                                "trackId":    track_id,
+                                "eventType":  "fall",
+                                "confidence": conf,
+                                "severity":   FallSeverity.CRITICAL,
+                            })
+                            self.last_alert_ts[person_key] = now_ts
 
                 # ── Severity update for non-impact / mid-pipeline states ───
                 self.current_severity[person_key] = self._compute_severity(person_key)
