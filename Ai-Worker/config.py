@@ -9,7 +9,7 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 ENV = os.environ.get("ENV", "development").lower()
 DATABASE_URL = os.environ.get("DATABASE_URL")
-ALERT_CREATE_URL = os.environ.get("ALERT_CREATE_URL", "http://localhost:3000/api/alerts")
+ALERT_CREATE_URL = os.environ.get("ALERT_CREATE_URL", "http://localhost:5000/api/alerts")
 
 DEFAULT_CAMERA_CONFIG = {
     "cam1": {
