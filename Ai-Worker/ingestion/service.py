@@ -60,6 +60,7 @@ class IngestionService:
             return False
 
     def _upsert_mediamtx_path(self, cam_id, camera_row):
+        """Insert/add MediaMTX path config for a camera."""
         if not cam_id or not camera_row:
             return
 
@@ -95,41 +96,58 @@ class IngestionService:
             "sourceOnDemand": True,
         }
 
-        # Primary call follows requested endpoint shape; fallback supports path-name URL styles.
+        add_url = f"{self.mediamtx_base_url}/v3/config/paths/add/{path_name}"
+        print(f"🔁 Inserting MediaMTX path for camera {cam_id}: {payload}")
+
         try:
-            response = requests.post(f"{self.mediamtx_base_url}/v3/config/paths/add/{path_name}", json=payload, timeout=5)
-            if response.status_code not in (200, 201, 204):
-                print(
-                    f"⚠️ [MediaMTX] Failed to upsert path {path_name}. "
-                    f"POST {self.mediamtx_base_url}/v3/config/paths/add/{path_name} -> {response.status_code}"
-                )
+            response = requests.post(add_url, json=payload, timeout=5)
+
+            if response.status_code in (200, 201, 204):
+                print(f"✅ [MediaMTX] Inserted path {path_name} (sourceOnDemand=true)")
                 return
-            print(f"✅ [MediaMTX] Upserted path {path_name} (sourceOnDemand=true)")
+            print(
+                f"⚠️ [MediaMTX] Failed to insert path {path_name}. "
+                f"POST {add_url} -> {response.status_code}"
+            )
         except Exception as exc:
-            print(f"❌ [MediaMTX] Upsert failed for camera {cam_id}: {exc}")
+            print(f"❌ [MediaMTX] Insert failed for camera {cam_id}: {exc}")
+
+    def _edit_mediamtx_path(self, cam_id, camera_row):
+        """Edit flow for camera path: delete existing config, then insert fresh config."""
+        if not cam_id or not camera_row:
+            return
+
+        print(f"🔁 [MediaMTX] Edit flow for {cam_id}: delete -> insert")
+        self._delete_mediamtx_path(cam_id)
+        self._handle_delete(cam_id)
+
+        # brief pause to let MediaMTX apply delete before re-add
+        time.sleep(0.1)
+        self._upsert_mediamtx_path(cam_id, camera_row)
 
     def _delete_mediamtx_path(self, cam_id):
         if not cam_id:
             return
 
         path_name = self._mediamtx_path_name(cam_id)
-        target_url = f"{self.mediamtx_base_url}/{path_name}"
+        remove_url = f"{self.mediamtx_base_url}/v3/config/paths/remove/{path_name}"
 
         try:
-            response = requests.delete(target_url, timeout=3)
+            response = requests.delete(remove_url, timeout=5)
             if response.status_code in (200, 202, 204, 404):
                 print(f"✅ [MediaMTX] Deleted path {path_name}")
                 return
 
-            # Fallback for APIs expecting payload on collection endpoint
-            fallback_response = requests.delete(self.mediamtx_base_url, json={"name": path_name}, timeout=3)
+            # Fallback for alternate endpoint styles
+            fallback_url = f"{self.mediamtx_base_url}/v3/config/paths/{path_name}"
+            fallback_response = requests.delete(fallback_url, timeout=5)
             if fallback_response.status_code in (200, 202, 204, 404):
                 print(f"✅ [MediaMTX] Deleted path {path_name}")
             else:
                 print(
                     f"⚠️ [MediaMTX] Failed to delete path {path_name}. "
-                    f"DELETE {target_url} -> {response.status_code}; "
-                    f"DELETE {self.mediamtx_base_url} -> {fallback_response.status_code}"
+                    f"DELETE {remove_url} -> {response.status_code}; "
+                    f"DELETE {fallback_url} -> {fallback_response.status_code}"
                 )
         except Exception as exc:
             print(f"❌ [MediaMTX] Delete failed for camera {cam_id}: {exc}")
@@ -517,13 +535,11 @@ class IngestionService:
 
                         # Update in-memory state and ensure a stream thread exists
                         self._update_camera_config_from_row(cam_id, camera_row)
-                        # In development, start ffmpeg to stream local files if present
-                        try:
-                            self._start_file_stream_if_dev(cam_id, camera_row)
-                        except Exception:
-                            pass
 
-                        self._upsert_mediamtx_path(cam_id, camera_row)
+                        if op and (op.startswith("update") or op.startswith("edit")):
+                            self._edit_mediamtx_path(cam_id, camera_row)
+                        else:
+                            self._upsert_mediamtx_path(cam_id, camera_row)
                         # health-check realtime-updated stream
                         try:
                             self._ffprobe_health_check(cam_id, camera_row.get("stream_url") or camera_row.get("url"))
