@@ -533,10 +533,19 @@ class IngestionService:
                                 self._handle_delete(cam_id)
                                 continue
 
-                        # Update in-memory state and ensure a stream thread exists
+                        # Determine previous URL so we only run edit flow when URL actually changed
+                        with self.state_lock:
+                            prev_cam = self.camera_config.get(cam_id, {})
+                            prev_url = (prev_cam.get("stream_url") or prev_cam.get("url")) if isinstance(prev_cam, dict) else None
+
+                        # Update in-memory state
                         self._update_camera_config_from_row(cam_id, camera_row)
 
-                        if op and (op.startswith("update") or op.startswith("edit")):
+                        new_url = camera_row.get("stream_url") or camera_row.get("url")
+
+                        # Only perform delete->insert edit when this is an update/edit event
+                        # and the URL changed (and there was a previous URL to replace).
+                        if op and (op.startswith("update") or op.startswith("edit")) and prev_url is not None and new_url != prev_url:
                             self._edit_mediamtx_path(cam_id, camera_row)
                         else:
                             self._upsert_mediamtx_path(cam_id, camera_row)
