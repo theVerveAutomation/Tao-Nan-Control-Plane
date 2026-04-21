@@ -15,7 +15,6 @@ services:
       - "8189:8189/udp" #udps
     volumes:
       - ./Ingestion-Gateway/mediamtx/mediamtx.yml:/mediamtx.yml
-      - ./Ingestion-Gateway/recordings:/recordings
 
 networks:
   app-net:
