@@ -54,7 +54,8 @@ ENABLE_RTMP_PUBLISH = os.environ.get("ENABLE_RTMP_PUBLISH", "true").lower() in {
     "yes",
     "on",
 }
-RTMP_BASE_URL = os.environ.get("RTMP_BASE_URL", "rtmp://localhost:1935/live")
+RTMP_BASE_URL_DETECTION = os.environ.get("RTMP_BASE_URL_DETECTION", "rtmp://localhost:1935/detection")
+RTMP_BASE_URL_LIVE = os.environ.get("RTMP_BASE_URL_LIVE", "rtmp://localhost:1935/live")
 RTMP_STREAM_PREFIX = os.environ.get("RTMP_STREAM_PREFIX", "cam_")
 RTMP_PUBLISH_FPS = int(os.environ.get("RTMP_PUBLISH_FPS", "10"))
 RTMP_FRAME_WIDTH = int(os.environ.get("RTMP_FRAME_WIDTH", "640"))
@@ -64,7 +65,7 @@ RTMP_VIDEO_CODEC = os.environ.get("RTMP_VIDEO_CODEC", "libx264")
 RTMP_FFMPEG_PRESET = os.environ.get("RTMP_FFMPEG_PRESET", "veryfast")
 
 # MediaMTX REST API base URL (paths endpoint)
-MEDIAMTX_BASE_URL = os.environ.get("MEDIAMTX_BASE_URL", "http://localhost:9997/v3/config/paths")
+MEDIAMTX_BASE_URL = os.environ.get("MEDIAMTX_BASE_URL", "http://localhost:9997/v3/paths/list")
 
 
 def get_default_camera_config():

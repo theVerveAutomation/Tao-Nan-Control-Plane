@@ -7,6 +7,9 @@ import time
 
 import cv2
 import requests
+import os
+import shutil
+import subprocess
 
 from config import (
     DEV_TARGET_FPS,
@@ -16,6 +19,8 @@ from config import (
     STREAM_RECONNECT_DELAY_SECONDS,
     get_default_camera_config,
     MEDIAMTX_BASE_URL,
+    RTMP_BASE_URL_LIVE,
+    RTMP_FFMPEG_BIN,
 )
 from .repository import PostgresCameraRepository
 
@@ -34,11 +39,25 @@ class IngestionService:
 
         self.repository = repository if repository is not None else PostgresCameraRepository()
         self.mediamtx_base_url = MEDIAMTX_BASE_URL
+        self.file_stream_procs = {}
 
     @staticmethod
     def _mediamtx_path_name(cam_id):
         safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(cam_id))
         return f"cam_{safe_id}"
+
+    def _mediamtx_available(self) -> bool:
+        """Quick health-check to avoid noisy 404/connection attempts during bootstrap."""
+        url = self.mediamtx_base_url
+        if not url:
+            return False
+        try:
+            print(f"🔍 Checking MediaMTX availability at {url}/v3/paths/list...")
+            resp = requests.get(f"{url}/v3/paths/list", timeout=5)
+            # treat redirects and OKs as available
+            return resp.status_code in (200, 204, 301, 302)
+        except Exception:
+            return False
 
     def _upsert_mediamtx_path(self, cam_id, camera_row):
         if not cam_id or not camera_row:
@@ -50,29 +69,42 @@ class IngestionService:
             return
 
         path_name = self._mediamtx_path_name(cam_id)
+        # If the configured source is a local file and we're in dev, stream it via ffmpeg
+        media_source = source_url
+        try:
+            is_local_file = False
+            if isinstance(source_url, str) and source_url.startswith("file://"):
+                is_local_file = True
+            elif isinstance(source_url, str) and os.path.exists(source_url):
+                is_local_file = True
+
+            if is_local_file and self.env == "development":
+                # ensure ffmpeg streamer is running and use the RTMP target as the MediaMTX source
+                try:
+                    self._start_file_stream_if_dev(cam_id, camera_row)
+                except Exception:
+                    pass
+                media_source = f"{RTMP_BASE_URL_LIVE.rstrip('/')}/{path_name}"
+
+        except Exception:
+            media_source = source_url
+
+        print(f"🔁 Upserting MediaMTX path for camera {cam_id}: {path_name} -> {media_source} (sourceOnDemand=true)")
         payload = {
             "name": path_name,
-            "source": source_url,
+            "source": media_source,
             "sourceOnDemand": True,
         }
 
         # Primary call follows requested endpoint shape; fallback supports path-name URL styles.
         try:
-            response = requests.post(self.mediamtx_base_url, json=payload, timeout=3)
+            response = requests.post(f"{self.mediamtx_base_url}/v3/config/paths/add/{path_name}", json=payload, timeout=3)
             if response.status_code not in (200, 201, 204):
-                alt_url = f"{self.mediamtx_base_url}/{path_name}"
-                alt_payload = {
-                    "source": source_url,
-                    "sourceOnDemand": True,
-                }
-                alt_response = requests.post(alt_url, json=alt_payload, timeout=3)
-                if alt_response.status_code not in (200, 201, 204):
-                    print(
-                        f"⚠️ [MediaMTX] Failed to upsert path {path_name}. "
-                        f"POST {self.mediamtx_base_url} -> {response.status_code}; "
-                        f"POST {alt_url} -> {alt_response.status_code}"
-                    )
-                    return
+                print(
+                    f"⚠️ [MediaMTX] Failed to upsert path {path_name}. "
+                    f"POST {self.mediamtx_base_url}/v3/config/paths/add/{path_name} -> {response.status_code}"
+                )
+                return
             print(f"✅ [MediaMTX] Upserted path {path_name} (sourceOnDemand=true)")
         except Exception as exc:
             print(f"❌ [MediaMTX] Upsert failed for camera {cam_id}: {exc}")
@@ -103,6 +135,155 @@ class IngestionService:
         except Exception as exc:
             print(f"❌ [MediaMTX] Delete failed for camera {cam_id}: {exc}")
 
+    def _ffmpeg_exists(self) -> bool:
+        return bool(shutil.which(RTMP_FFMPEG_BIN) or shutil.which("ffmpeg"))
+
+    def _ffprobe_health_check(self, cam_id, url, timeout=5):
+        """Run ffprobe on `url` and log common incompatibilities (H264 with B-frames, non-H264 codecs).
+
+        This is best-effort and will not raise on failure.
+        """
+        # locate ffprobe
+        ffprobe_bin = shutil.which("ffprobe")
+        if not ffprobe_bin:
+            # try deriving from configured ffmpeg binary
+            maybe = shutil.which(RTMP_FFMPEG_BIN) if RTMP_FFMPEG_BIN else None
+            if maybe:
+                ffprobe_bin = maybe.replace("ffmpeg", "ffprobe")
+        if not ffprobe_bin:
+            print(f"⚠️ [Health] ffprobe not found; cannot health-check stream for {cam_id}")
+            return
+
+        cmd = [
+            ffprobe_bin,
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_name,codec_type,profile,has_b_frames",
+            "-of",
+            "json",
+            url,
+        ]
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if proc.returncode != 0:
+                # non-fatal; ffprobe may not support probing some RTMP/HTTP endpoints immediately
+                print(f"⚠️ [Health] ffprobe failed for {cam_id} ({url}): {proc.stderr.strip()}")
+                return
+
+            import json as _json
+
+            info = _json.loads(proc.stdout or "{}")
+            streams = info.get("streams", [])
+            for s in streams:
+                if s.get("codec_type") != "video":
+                    continue
+                codec = s.get("codec_name")
+                profile = s.get("profile")
+                has_b = int(s.get("has_b_frames", 0)) if s.get("has_b_frames") is not None else 0
+
+                if codec and codec.lower() != "h264":
+                    print(
+                        f"⚠️ [Health] Camera {cam_id} uses codec {codec} (profile={profile}). WebRTC may not support this directly."
+                    )
+                if codec and codec.lower() == "h264" and has_b:
+                    print(
+                        f"⚠️ [Health] Camera {cam_id} H264 stream contains B-frames (has_b_frames={has_b}). WebRTC consumers may reject it. Consider re-encoding with -bf 0 / -tune zerolatency."
+                    )
+                # If no explicit issues, report readiness
+                if (not codec) or (codec and codec.lower() == "h264" and not has_b):
+                    print(f"✅ [Health] Camera {cam_id} stream appears compatible (codec={codec} profile={profile}).")
+                # only inspect first video stream
+                break
+        except Exception as exc:
+            print(f"⚠️ [Health] ffprobe error for {cam_id} ({url}): {exc}")
+
+    def _start_file_stream_if_dev(self, cam_id, camera_row):
+        """In development, if the camera source is a local file, start ffmpeg to push it to the RTMP target."""
+        if self.env != "development":
+            return
+        source = camera_row.get("stream_url") or camera_row.get("url") or camera_row.get("file")
+        if not source:
+            return
+
+        # normalize file:// URIs
+        if source.startswith("file://"):
+            source_path = source[7:]
+        else:
+            source_path = source
+
+        # Determine whether this is a local file or a network stream
+        is_file = isinstance(source_path, str) and os.path.exists(source_path)
+
+        # build RTMP target using RTMP_BASE_URL_LIVE and mediamtx path name
+        path_name = self._mediamtx_path_name(cam_id)
+        target = f"{RTMP_BASE_URL_LIVE.rstrip('/')}/{path_name}"
+
+        # already running
+        if cam_id in self.file_stream_procs:
+            return
+
+        ffmpeg_bin = shutil.which(RTMP_FFMPEG_BIN) or shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            print(f"⚠️ [FFmpeg] ffmpeg not found on PATH; cannot stream for {cam_id}")
+            return
+
+        # Build ffmpeg command. Re-encode only for local files to force -bf 0;
+        # for network camera streams, push via copy to avoid extra CPU cost.
+        if is_file:
+            cmd = [ffmpeg_bin, "-re", "-stream_loop", "-1", "-i", source_path]
+            cmd += [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-tune",
+                "zerolatency",
+                "-profile:v",
+                "baseline",
+                "-level",
+                "3.1",
+                "-x264-params",
+                "no-scenecut=1:keyint=50",
+                "-bf",
+                "0",
+                "-g",
+                "50",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-f",
+                "flv",
+                target,
+            ]
+            print(f"⚡ [Dev Mode] Starting ffmpeg re-encode stream for local file camera {cam_id}: {source_path} -> {target}")
+        else:
+            # For network sources (IP camera), forward without re-encoding to reduce CPU.
+            cmd = [ffmpeg_bin, "-i", source_path, "-c", "copy", "-f", "flv", target]
+            print(f"⚡ [Dev Mode] Forwarding network stream for camera {cam_id}: {source_path} -> {target} (copy)")
+
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.file_stream_procs[cam_id] = proc
+            print(f"🔁 [FFmpeg] Started stream (pid={proc.pid}) for {cam_id}")
+        except Exception as exc:
+            print(f"❌ [FFmpeg] Failed to start stream for {cam_id}: {exc}")
+
+    def _stop_file_stream(self, cam_id):
+        proc = self.file_stream_procs.pop(cam_id, None)
+        if not proc:
+            return
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
+        except Exception:
+            pass
+
     def bootstrap_cameras_from_db(self):
         if not self.db_available:
             return
@@ -118,6 +299,31 @@ class IngestionService:
             self.frame_queues.clear()
             for cam_id in self.camera_config:
                 self.frame_queues[cam_id] = queue.Queue(maxsize=FRAME_QUEUE_MAXSIZE)
+
+        # Register camera streams with MediaMTX so they appear as on-demand paths
+        if self._mediamtx_available():
+            print(f"✅ [MediaMTX] Available at {self.mediamtx_base_url}. Upserting paths for existing cameras...")
+            for cam_id, cam_row in list(self.camera_config.items()):
+                try:
+                    # In development, optionally start ffmpeg streaming local files
+                    try:
+                        self._start_file_stream_if_dev(cam_id, cam_row)
+                    except Exception:
+                        pass
+
+                    self._upsert_mediamtx_path(cam_id, cam_row)
+
+                    # health-check stream compatibility (ffprobe)
+                    try:
+                        self._ffprobe_health_check(cam_id, media_source if 'media_source' in locals() else (cam_row.get('stream_url') or cam_row.get('url')))
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    print(f"⚠️ [MediaMTX] Upsert failed during bootstrap for {cam_id}: {exc}")
+        else:
+            print(
+                f"⚠️ [MediaMTX] Base URL {self.mediamtx_base_url} not reachable or API missing; skipping path upserts."
+            )
 
         print(f"✅ [Bootstrap] Loaded {len(self.camera_config)} cameras from DB.")
 
@@ -196,6 +402,12 @@ class IngestionService:
                 thread.join(timeout=1.0)
             except Exception:
                 pass
+
+        # stop any dev ffmpeg file stream for this camera
+        try:
+            self._stop_file_stream(cam_id)
+        except Exception:
+            pass
 
         with self.state_lock:
             self.stop_events.pop(cam_id, None)
@@ -314,7 +526,18 @@ class IngestionService:
 
                         # Update in-memory state and ensure a stream thread exists
                         self._update_camera_config_from_row(cam_id, camera_row)
+                        # In development, start ffmpeg to stream local files if present
+                        try:
+                            self._start_file_stream_if_dev(cam_id, camera_row)
+                        except Exception:
+                            pass
+
                         self._upsert_mediamtx_path(cam_id, camera_row)
+                        # health-check realtime-updated stream
+                        try:
+                            self._ffprobe_health_check(cam_id, camera_row.get("stream_url") or camera_row.get("url"))
+                        except Exception:
+                            pass
                         self._ensure_stream_thread(cam_id)
         except Exception as exc:
             print(f"❌ [Realtime] Database listener failed: {exc}. Running on default config.")

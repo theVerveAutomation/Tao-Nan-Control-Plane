@@ -91,7 +91,7 @@ class RuleBasedFallPlugin:
         self.last_seen    = {}
         self.last_alert_ts = {}
 
-        print(
+        self._debug(
             f"[FallPlugin] frame={frame_width}×{frame_height}  res_scale={res_scale:.3f}\n"
             f"  DESCENT_VEL_THRESH  = {self.DESCENT_VEL_THRESH:.0f} px/s\n"
             f"  IMPACT_VEL_THRESH   = {self.IMPACT_VEL_THRESH:.0f} px/s  [FIX A — was {1000.0*res_scale:.0f}]\n"
@@ -102,8 +102,7 @@ class RuleBasedFallPlugin:
             f"  MIN_PERSON_AREA     = {self.MIN_PERSON_AREA} px²\n"
             f"  GROUND_CONFIRM_TIME = {self.GROUND_CONFIRM_TIME:.2f} s\n"
             f"  STREAM_FPS (fixed dt)= {self.STREAM_FPS}  [FIX B]\n"
-            f"  overhead_override   = {self.overhead_camera_override}",
-            flush=True,
+            f"  overhead_override   = {self.overhead_camera_override}"
         )
 
     # ──────────────────────────────────────────────────────────────────────
@@ -160,10 +159,9 @@ class RuleBasedFallPlugin:
 
         if self.overhead_camera_override is not None:
             self.camera_mode[cam_id] = bool(self.overhead_camera_override)
-            print(
+            self._debug(
                 f"[FallPlugin] {cam_id} mode FORCED: "
-                f"{'OVERHEAD' if self.camera_mode[cam_id] else 'SIDE'}",
-                flush=True,
+                f"{'OVERHEAD' if self.camera_mode[cam_id] else 'SIDE'}"
             )
             return
 
@@ -177,11 +175,10 @@ class RuleBasedFallPlugin:
         vote_ratio   = median_ratio > 0.55
         vote_angle   = median_angle < 45.0
         self.camera_mode[cam_id] = vote_ratio and vote_angle
-        print(
+        self._debug(
             f"[FallPlugin] {cam_id} AUTO mode: "
             f"{'OVERHEAD' if self.camera_mode[cam_id] else 'SIDE'} "
-            f"(ratio={median_ratio:.3f}, angle={median_angle:.1f}°)",
-            flush=True,
+            f"(ratio={median_ratio:.3f}, angle={median_angle:.1f}°)"
         )
 
     def _velocity_cap(self, person_key, hot_descent_frames: int) -> float:
@@ -289,38 +286,35 @@ class RuleBasedFallPlugin:
                 fw = int(person.get("frame_width",  self.frame_width))
                 fh = int(person.get("frame_height", self.frame_height))
 
-                print(
+                self._debug(
                     f"[FallPlugin] INTAKE cam={cam_id} id={track_id} "
                     f"conf={conf:.2f} bbox={bbox is not None} "
                     f"kps_type={type(kps_raw).__name__} "
-                    f"kps_shape={np.array(kps_raw).shape if kps_raw is not None else 'None'}",
-                    flush=True,
+                    f"kps_shape={np.array(kps_raw).shape if kps_raw is not None else 'None'}"
                 )
 
                 # ── Basic validity checks ──────────────────────────────────
                 if bbox is None:
-                    print(f"[FallPlugin] SKIP cam={cam_id} id={track_id} — bbox is None", flush=True)
+                    self._debug(f"[FallPlugin] SKIP cam={cam_id} id={track_id} — bbox is None")
                     continue
 
                 if conf < self.conf_threshold:
-                    print(
+                    self._debug(
                         f"[FallPlugin] SKIP cam={cam_id} id={track_id} "
-                        f"— conf {conf:.2f} < {self.conf_threshold}",
-                        flush=True,
+                        f"— conf {conf:.2f} < {self.conf_threshold}"
                     )
                     continue
 
                 if kps_raw is None:
-                    print(f"[FallPlugin] SKIP cam={cam_id} id={track_id} — keypoints is None", flush=True)
+                    self._debug(f"[FallPlugin] SKIP cam={cam_id} id={track_id} — keypoints is None")
                     continue
 
                 kps = np.array(kps_raw, dtype=float)
 
                 if kps.ndim != 2 or kps.shape[0] < 17:
-                    print(
+                    self._debug(
                         f"[FallPlugin] SKIP cam={cam_id} id={track_id} "
-                        f"— bad kps shape {kps.shape}",
-                        flush=True,
+                        f"— bad kps shape {kps.shape}"
                     )
                     continue
 
@@ -331,10 +325,9 @@ class RuleBasedFallPlugin:
                     kps_conf     = kps[:, 2]
                     critical_conf = float(np.mean(kps_conf[self.CRITICAL_KPS]))
                     if critical_conf < self.KP_CONF_THRESH:
-                        print(
+                        self._debug(
                             f"[FallPlugin] SKIP cam={cam_id} id={track_id} "
-                            f"— critical kp conf {critical_conf:.2f} < {self.KP_CONF_THRESH}",
-                            flush=True,
+                            f"— critical kp conf {critical_conf:.2f} < {self.KP_CONF_THRESH}"
                         )
                         continue
                 else:
@@ -342,10 +335,9 @@ class RuleBasedFallPlugin:
                     ys    = kps_xy[:, 1]
                     valid = (xs > 0) & (ys > 0)
                     if int(valid.sum()) < 8:
-                        print(
+                        self._debug(
                             f"[FallPlugin] SKIP cam={cam_id} id={track_id} "
-                            f"— only {int(valid.sum())} valid kps (need 8)",
-                            flush=True,
+                            f"— only {int(valid.sum())} valid kps (need 8)"
                         )
                         continue
 
@@ -444,22 +436,20 @@ class RuleBasedFallPlugin:
 
                 self.velocity_y[person_key] = drop
 
-                print(
+                self._debug(
                     f"[FallPlugin] PHYSICS cam={cam_id} id={track_id} "
                     f"ratio={body_ratio:.2f} angle={torso_angle:.1f} "
                     f"drop={drop:.1f} is_upright={is_upright} "
                     f"descent={self.descent_counter[person_key]} "
                     f"impact={self.impact_detected[person_key]} "
-                    f"baseline_locked={self.is_baseline_locked.get(person_key, False)}",
-                    flush=True,
+                    f"baseline_locked={self.is_baseline_locked.get(person_key, False)}"
                 )
 
                 # Pipeline state check after physics ───────────────────────
-                print(
+                self._debug(
                     f"[CHECK] descent={self.descent_counter[person_key]} "
                     f"impact={self.impact_detected[person_key]} "
-                    f"ground={self.ground_confirm_accum[person_key]:.3f}",
-                    flush=True,
+                    f"ground={self.ground_confirm_accum[person_key]:.3f}"
                 )
 
                 # ══════════════════════════════════════════════════════════
@@ -619,13 +609,12 @@ class RuleBasedFallPlugin:
                     if body_ratio > thresholds["GROUND_CONFIRM_RATIO"]:
                         self.ground_confirm_accum[person_key] += dt
 
-                    print(
+                    self._debug(
                         f"[FallPlugin] GROUND_DEBUG cam={cam_id} id={track_id} "
                         f"accum={self.ground_confirm_accum[person_key]:.3f}s "
                         f"ratio={body_ratio:.2f} "
                         f"(confirm when accum>{self.GROUND_CONFIRM_TIME} "
-                        f"& ratio>{thresholds['GROUND_CONFIRM_RATIO']})",
-                        flush=True,
+                        f"& ratio>{thresholds['GROUND_CONFIRM_RATIO']})"
                     )
 
                     if self.ground_confirm_accum[person_key] >= self.GROUND_CONFIRM_TIME:

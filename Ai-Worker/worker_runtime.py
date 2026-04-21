@@ -9,7 +9,7 @@ from config import (
     CLIP_RECORDER_FPS,
     ENABLE_RTMP_PUBLISH,
     ENV,
-    RTMP_BASE_URL,
+    RTMP_BASE_URL_DETECTION,
     RTMP_FFMPEG_BIN,
     RTMP_FFMPEG_PRESET,
     RTMP_FRAME_HEIGHT,
@@ -45,7 +45,7 @@ class WorkerRuntime:
         self.fall_persist = {}
         self.rtmp_hub = RtmpPublisherHub(
             enabled=ENABLE_RTMP_PUBLISH,
-            base_url=RTMP_BASE_URL,
+            base_url=RTMP_BASE_URL_DETECTION,
             stream_prefix=RTMP_STREAM_PREFIX,
             fps=RTMP_PUBLISH_FPS,
             width=RTMP_FRAME_WIDTH,
@@ -251,7 +251,17 @@ class WorkerRuntime:
                     time.sleep(0.01)
                     continue
 
-                scene_state = self.backbone.process_batch(current_batch)
+                # Only run processing for cameras with detections enabled.
+                filtered_batch = {
+                    cam_id: frame for cam_id, frame in current_batch.items() if self._is_detection_enabled(cam_id)
+                }
+                if not filtered_batch:
+                    # No cameras in this batch have detections enabled; skip processing.
+                    #print("⚡ Received batch with no detection-enabled cameras. Skipping AI processing for this batch.")
+                    time.sleep(0.01)
+                    continue
+
+                scene_state = self.backbone.process_batch(filtered_batch)
                 if not scene_state:
                     continue
 
@@ -288,7 +298,7 @@ class WorkerRuntime:
 
         if ENABLE_RTMP_PUBLISH:
             if ffmpeg_exists(RTMP_FFMPEG_BIN):
-                print(f"[RTMP] Publisher enabled. Base URL: {RTMP_BASE_URL}")
+                print(f"[RTMP] Publisher enabled. Base URL: {RTMP_BASE_URL_DETECTION}")
             else:
                 print(
                     f"[RTMP] WARNING: ffmpeg binary '{RTMP_FFMPEG_BIN}' not found. "
@@ -310,7 +320,7 @@ class WorkerRuntime:
         try:
             # Rule-based fall plugin processes the scene_state passed by runtime,
             # and runtime will filter out cameras without detections before calling plugins.
-            self.plugins.append(RuleBasedFallPlugin())
+            self.plugins.append(RuleBasedFallPlugin(debug=False))
         except Exception as exc:
             print(f"⚠️ [Plugins] Failed to initialize RuleBasedFallPlugin: {exc}")
 
