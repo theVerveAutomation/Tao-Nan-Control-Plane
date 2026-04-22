@@ -19,7 +19,7 @@ services:
   ai-worker:
     build:
       context: . # Builds from the root directory
-      dockerfile: Dockerfile
+      dockerfile: Ai-Worker/Dockerfile
     container_name: ai_worker_tao_nan
     networks:
       - app-net
