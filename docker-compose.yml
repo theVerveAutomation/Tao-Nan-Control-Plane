@@ -16,6 +16,29 @@ services:
     volumes:
       - ./Ingestion-Gateway/mediamtx/mediamtx.yml:/mediamtx.yml
 
+  ai-worker:
+    build:
+      context: . # Builds from the root directory
+      dockerfile: Dockerfile
+    container_name: ai_worker_tao_nan
+    networks:
+      - app-net
+    restart: unless-stopped
+    depends_on:
+      - mediamtx
+
+    env_file:
+      - ./Ai-Worker/.env
+
+    # CRITICAL: This grants Docker access to your NVIDIA RTX 4050
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+
 networks:
   app-net:
     driver: bridge
