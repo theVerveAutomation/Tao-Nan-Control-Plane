@@ -11,15 +11,6 @@ ENV = os.environ.get("ENV", "development").lower()
 DATABASE_URL = os.environ.get("DATABASE_URL")
 ALERT_CREATE_URL = os.environ.get("ALERT_CREATE_URL", "http://localhost:5000/api/alerts")
 
-DEFAULT_CAMERA_CONFIG = {
-    "cam1": {
-        "url": "./Tussle.mp4",
-        "is_active": True,
-        "fall_detection": True,
-        "tussle_detection": True,
-    }
-}
-
 YOLO_MODEL_PATH = os.environ.get("YOLO_MODEL_PATH", "yolov8n-pose.pt")
 TUSSLE_MODEL_PATH = os.environ.get("TUSSLE_MODEL_PATH", "./best_slowfast_fight_model (2).pth")
 
@@ -67,6 +58,3 @@ RTMP_FFMPEG_PRESET = os.environ.get("RTMP_FFMPEG_PRESET", "veryfast")
 # MediaMTX REST API base URL (paths endpoint)
 MEDIAMTX_BASE_URL = os.environ.get("MEDIAMTX_BASE_URL", "http://localhost:9997/v3/paths/list")
 
-
-def get_default_camera_config():
-    return deepcopy(DEFAULT_CAMERA_CONFIG)
