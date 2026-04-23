@@ -17,7 +17,6 @@ from config import (
     FRAME_QUEUE_MAXSIZE,
     STREAM_MAX_READ_FAILURES,
     STREAM_RECONNECT_DELAY_SECONDS,
-    get_default_camera_config,
     MEDIAMTX_BASE_URL,
     RTMP_BASE_URL_LIVE,
     RTMP_FFMPEG_BIN,
@@ -27,7 +26,7 @@ from .repository import PostgresCameraRepository
 
 class IngestionService:
     def __init__(self, camera_config=None, env=None, repository=None, db_available=True):
-        self.camera_config = camera_config or get_default_camera_config()
+        self.camera_config = camera_config
         self.env = (env or ENV).lower()
         self.db_available = db_available
 
