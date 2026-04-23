@@ -25,7 +25,7 @@ from .repository import PostgresCameraRepository
 
 
 class IngestionService:
-    def __init__(self, camera_config=None, env=None, repository=None, db_available=True):
+    def __init__(self, camera_config={}, env=None, repository=None, db_available=True):
         self.camera_config = camera_config
         self.env = (env or ENV).lower()
         self.db_available = db_available
