@@ -43,6 +43,7 @@ class WorkerRuntime:
         self.recorder = None
         self.alert_dispatcher = AlertDispatcher()
         self.fall_persist = {}
+        self.tussle_persist = {}  # tracks tussle detections per camera for annotation
         self.rtmp_hub = RtmpPublisherHub(
             enabled=ENABLE_RTMP_PUBLISH,
             base_url=RTMP_BASE_URL_DETECTION,
@@ -93,6 +94,9 @@ class WorkerRuntime:
                     key = (trigger_cam, alert["trackId"])
                     self.fall_persist[key] = time.time()
 
+                if alert["eventType"] == "tussle":
+                    self.tussle_persist[trigger_cam] = time.time()
+
                 if trigger_cam not in enabled_scene_state:
                     continue
 
@@ -116,6 +120,14 @@ class WorkerRuntime:
             frame = state["raw_frame"]
             tracked = state["tracked_people"]
 
+            # Check tussle at camera level (tussle plugin has no per-person track ID)
+            is_tussle = False
+            if cam_id in self.tussle_persist:
+                if now - self.tussle_persist[cam_id] < 3.0:
+                    is_tussle = True
+                else:
+                    del self.tussle_persist[cam_id]
+
             for track_id, person in tracked.items():
                 x1, y1, x2, y2 = map(int, person["bbox"])
 
@@ -128,10 +140,13 @@ class WorkerRuntime:
                         del self.fall_persist[key]
 
                 if is_fall:
-                    color = (0, 0, 255)
+                    color = (0, 0, 255)       # red
                     label = f"FALL ID {track_id}"
+                elif is_tussle:
+                    color = (0, 165, 255)     # orange
+                    label = f"TUSSLE ID {track_id}"
                 else:
-                    color = (0, 255, 0)
+                    color = (0, 255, 0)       # green
                     label = f"ID {track_id}"
 
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
