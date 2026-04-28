@@ -17,4 +17,4 @@ __pycache__/
 
 # Env
 .env
-web-dashboard
+/web-dashboard

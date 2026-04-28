@@ -15,9 +15,13 @@ class ClipRecorder:
         self.buffers = {}       # Holds the continuous 'Before' frames: { cam_id: deque }
         self.recordings = {}    # Holds the active recordings: { cam_id: dict }
         
-        # Ensure the output directory exists
-        self.output_dir = "../web-dashboard/public/alerts/clips"
-        os.makedirs(self.output_dir, exist_ok=True)
+        # --- NEW SHARED STORAGE PATH ---
+        # Base shared directory: ../shared_storage/alerts
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        self.shared_base = os.path.abspath(os.path.join(current_dir, "..", "..", "shared_storage", "alerts"))
+
+        # Ensure the base shared directory exists
+        os.makedirs(self.shared_base, exist_ok=True)
 
     def update_frame(self, cam_id, frame):
         """Called every cycle to keep the rolling buffer fresh."""
@@ -45,10 +49,10 @@ class ClipRecorder:
         if cam_id in self.recordings:
             return None
 
-        filename = f"{cam_id}_{event_type}_{timestamp}.mp4"
+        filename = f"{cam_id}_{event_type}_{timestamp}.webm"
         
-        # Grab the entire history of the 'Before' buffer
-        current_history = list(self.buffers[cam_id])
+        # Grab the entire history of the 'Before' buffer (may be empty)
+        current_history = list(self.buffers.get(cam_id, []))
         
         # Move it into the active recordings dictionary
         self.recordings[cam_id] = {
@@ -57,13 +61,17 @@ class ClipRecorder:
             'filename': filename
         }
         
-        return f"/alerts/clips/{filename}"
+        # The pointer path returned for the database
+        return f"/alerts/{cam_id}/clips/{filename}"
 
     def _save_clip(self, cam_id):
         """Prepares the data and hands it to a background thread."""
         rec_data = self.recordings.pop(cam_id)
         frames = rec_data['frames']
-        filepath = os.path.join(self.output_dir, rec_data['filename'])
+        # Ensure per-camera clips dir exists
+        cam_dir = os.path.join(self.shared_base, cam_id, "clips")
+        os.makedirs(cam_dir, exist_ok=True)
+        filepath = os.path.join(cam_dir, rec_data['filename'])
 
         # START A BACKGROUND THREAD!
         # This prevents the AI loop from freezing while OpenCV compiles the .mp4
@@ -77,7 +85,7 @@ class ClipRecorder:
         h, w, _ = frames[0].shape
         
         # Use mp4v codec for standard .mp4 files
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fourcc = cv2.VideoWriter_fourcc(*'vp80')
         out = cv2.VideoWriter(filepath, fourcc, self.fps, (w, h))
         
         for f in frames:
