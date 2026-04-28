@@ -62,8 +62,6 @@ class WorkerRuntime:
     @staticmethod
     def _is_detection_enabled(cam_id):
         cam_cfg = CAMERA_CONFIG.get(cam_id, {})
-        # Prefer the DB-driven `detections` flag (newer name). Fall back to
-        # `detection` for backward compatibility, then `is_active`.
         return bool(
             cam_cfg.get("detections", cam_cfg.get("detection", cam_cfg.get("is_active", True)))
         )
@@ -77,7 +75,6 @@ class WorkerRuntime:
 
         for plugin in self.plugins:
             if isinstance(plugin, TusslePlugin):
-                # Tussle plugin keeps per-camera state; guard against unknown cameras.
                 tussle_input = {
                     cam_id: state["raw_frame"]
                     for cam_id, state in enabled_scene_state.items()
@@ -102,6 +99,12 @@ class WorkerRuntime:
                 trigger_frame = enabled_scene_state[trigger_cam]["raw_frame"]
                 timestamp = int(time.time())
                 video_path = self.recorder.trigger(trigger_cam, alert["eventType"], timestamp)
+
+                # If trigger() returned None it means an identical key already exists
+                # (same camera + event type + same second). Skip rather than saving null video.
+                if video_path is None:
+                    print(f"⏭️ Skipping duplicate alert for {trigger_cam} — same recording key exists")
+                    continue
 
                 alert["timestamp"] = timestamp
                 alert["videoPath"] = video_path
@@ -143,27 +146,21 @@ class WorkerRuntime:
                 )
 
     def _publish_display_frames(self, scene_state):
-        # Skip local display when not in development or when RTMP publishing is active
         if self.env != "development" or ENABLE_RTMP_PUBLISH:
             return
 
         with self.display_lock:
             for cam_id, state in scene_state.items():
-                # ensure display_frames contains the camera key (handles runtime-added cameras)
                 if cam_id not in self.display_frames:
                     self.display_frames[cam_id] = None
                 self.display_frames[cam_id] = state["raw_frame"].copy()
 
-                # Auto-add camera id to runtime list if introduced at runtime
                 if cam_id not in self.camera_ids:
                     print(f"🔔 [Runtime] New camera detected at runtime: {cam_id}. Adding to camera_ids.")
                     self.camera_ids.append(cam_id)
 
                     updated_plugins = []
-                    # Update plugins that track camera_ids (best-effort) and try reinitialization
                     for plugin in self.plugins:
-                        # Only add runtime-introduced cameras to plugins if
-                        # detections are enabled for that camera.
                         if not self._is_detection_enabled(cam_id):
                             continue
 
@@ -172,14 +169,12 @@ class WorkerRuntime:
                                 plugin.camera_ids.append(cam_id)
                                 updated_plugins.append(plugin.__class__.__name__)
 
-                                # Call plugin hook if available to allow reinitialization for the new camera
                                 try:
                                     if hasattr(plugin, "on_camera_added"):
                                         plugin.on_camera_added(cam_id)
                                     elif hasattr(plugin, "reinitialize"):
                                         plugin.reinitialize(cam_id)
                                 except Exception:
-                                    # non-fatal; proceed to next plugin
                                     pass
 
                     if updated_plugins:
@@ -198,7 +193,6 @@ class WorkerRuntime:
         self.rtmp_hub.prune_removed_cameras(CAMERA_CONFIG.keys())
 
     def _render_display_windows(self):
-        # Skip local window rendering when not in development or when RTMP publishing is active
         if self.env != "development" or ENABLE_RTMP_PUBLISH:
             return
 
@@ -251,13 +245,10 @@ class WorkerRuntime:
                     time.sleep(0.01)
                     continue
 
-                # Only run processing for cameras with detections enabled.
                 filtered_batch = {
                     cam_id: frame for cam_id, frame in current_batch.items() if self._is_detection_enabled(cam_id)
                 }
                 if not filtered_batch:
-                    # No cameras in this batch have detections enabled; skip processing.
-                    #print("⚡ Received batch with no detection-enabled cameras. Skipping AI processing for this batch.")
                     time.sleep(0.01)
                     continue
 
@@ -291,7 +282,6 @@ class WorkerRuntime:
 
         self.backbone = SharedBackbone()
 
-        # Only enable local OpenCV preview when in development *and* RTMP publishing is disabled.
         if self.env == "development" and not ENABLE_RTMP_PUBLISH:
             self.display_frames = {cam_id: None for cam_id in self.camera_ids}
             print("[Display] Running display rendering on main runtime thread.")
@@ -308,8 +298,6 @@ class WorkerRuntime:
         print("🔌 Loading AI Plugins (controlled by camera_config.detections)...")
         self.plugins = []
 
-        # Determine which cameras have detections enabled and pass that list
-        # to plugins that accept per-camera configuration.
         detection_enabled_cams = [cam for cam in self.camera_ids if self._is_detection_enabled(cam)]
 
         try:
@@ -318,8 +306,6 @@ class WorkerRuntime:
             print(f"⚠️ [Plugins] Failed to initialize TusslePlugin: {exc}")
 
         try:
-            # Rule-based fall plugin processes the scene_state passed by runtime,
-            # and runtime will filter out cameras without detections before calling plugins.
             self.plugins.append(RuleBasedFallPlugin(debug=False))
         except Exception as exc:
             print(f"⚠️ [Plugins] Failed to initialize RuleBasedFallPlugin: {exc}")
@@ -330,4 +316,3 @@ class WorkerRuntime:
             fps=CLIP_RECORDER_FPS,
         )
         print("🚀 Master Loop Online. Analyzing streams...")
-

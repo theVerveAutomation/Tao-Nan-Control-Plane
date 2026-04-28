@@ -1,4 +1,5 @@
 import os
+import time
 import threading
 from collections import defaultdict
 
@@ -7,16 +8,17 @@ import requests
 
 from config import ALERT_COOLDOWN_SECONDS, ALERT_CREATE_URL
 
+
 class AlertDispatcher:
     def __init__(self, alert_create_url=None):
         self.alert_create_url = alert_create_url or ALERT_CREATE_URL
         self.alert_cooldowns = defaultdict(lambda: {"fall": 0, "tussle": 0})
-        
-        # --- NEW SHARED STORAGE PATH (per-camera) ---
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        self.alerts_base = os.path.abspath(os.path.join(current_dir, "..", "..", "shared_storage", "alerts"))
 
-        # Ensure the base directory exists once on boot
+        # --- SHARED STORAGE PATH (per-camera) ---
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        self.alerts_base = os.path.abspath(
+            os.path.join(current_dir, "..", "..", "shared_storage", "alerts")
+        )
         os.makedirs(self.alerts_base, exist_ok=True)
 
     def send(self, alert_data, raw_frame):
@@ -29,7 +31,7 @@ class AlertDispatcher:
         self.alert_cooldowns[cam_id][event_type] = current_time
 
         filename = f"{cam_id}_{event_type}_{current_time}.jpg"
-        
+
         # Use per-camera snapshots directory
         snaps_dir = os.path.join(self.alerts_base, cam_id, "snapshots")
         os.makedirs(snaps_dir, exist_ok=True)
@@ -50,7 +52,10 @@ class AlertDispatcher:
     def _post_alert(self, payload):
         """Background worker to handle network requests securely."""
         try:
-            # Added a 5-second timeout to prevent indefinite hanging
+            # Wait for the video writer background thread to finish writing the clip
+            # before notifying the backend — prevents null video on fast detections
+            time.sleep(22)
+
             response = requests.post(self.alert_create_url, json=payload, timeout=5)
             if response.ok:
                 print(f"🚨 ALERT SAVED: {payload['eventType'].upper()} on {payload['cameraId']} -> {self.alert_create_url}")
