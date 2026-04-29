@@ -37,7 +37,7 @@ class RuleBasedFallPlugin:
         frame_height: int = 540,
         debug: bool = False,
     ):
-        print("⚡ Initializing Fall Detection Plugin (Advanced Rule-Based v5)...")
+        print("⚡ Initializing Fall Detection Plugin (Advanced Rule-Based v7 — all cameras)...")
 
         self.conf_threshold           = confidence_threshold
         self.overhead_camera_override = overhead_camera_override
@@ -52,26 +52,30 @@ class RuleBasedFallPlugin:
         # ── Timing / motion constants ──────────────────────────────────────
         self.BASELINE_TIME        = 1.5
         self.UPRIGHT_ANGLE        = 18
-        self.GROUND_CONFIRM_TIME  = 0.5    # raised from 0.06 — requires ~12 frames of lying flat
-        self.CRITICAL_GROUND_TIME = 3.0    # seconds on ground after HIGH alert → escalate to CRITICAL
-        self.MIN_DESCENT_FRAMES   = 3      # raised from 2 — filters single-frame velocity spikes
+        self.GROUND_CONFIRM_TIME  = 0.5
+        self.CRITICAL_GROUND_TIME = 3.0
+        self.MIN_DESCENT_FRAMES   = 3
         self.RECOVERY_COOLDOWN    = 5.0
         self.INERTIA_TIME         = 0.6
         self.KP_CONF_THRESH       = 0.30
         self.STREAM_FPS           = 25.0
 
-        # ── Velocity thresholds (scaled to actual resolution) ──────────────
+        # ── FIX A: dt bounds ──────────────────────────────────────────────
+        self.DT_MIN = 1.0 / 60.0
+        self.DT_MAX = 1.0 / 8.0
+
+        # ── Velocity thresholds ────────────────────────────────────────────
         self.DESCENT_VEL_THRESH   = 90.0    * res_scale
         self.IMPACT_VEL_THRESH    = 180.0   * res_scale
-        self.IMPACT_VEL_CAP_COLD  = 5000.0  * res_scale
+        self.IMPACT_VEL_CAP_COLD  = 12000.0 * res_scale
         self.IMPACT_VEL_CAP_HOT   = 20000.0 * res_scale
 
         # ── Exercise / seated suppression ─────────────────────────────────
-        self.EXERCISE_MAX_PEAK_DROP     = 900.0 * res_scale  # tightened from 1200 — catches slower seated drops
-        self.EXERCISE_SLOW_DESCENT_TIME = 0.40               # tightened from 0.55 — suppress exercise sooner
+        self.EXERCISE_MAX_PEAK_DROP     = 900.0 * res_scale
+        self.EXERCISE_SLOW_DESCENT_TIME = 0.40
         self.PEAK_DROP_WINDOW           = 40
 
-        # ── Ghost / partial-detection guards (scaled) ──────────────────────
+        # ── Ghost / partial-detection guards ──────────────────────────────
         self.MAX_HIP_JUMP_PX = 500.0  * res_scale
         self.EDGE_MARGIN     = max(15, int(40 * res_scale))
         self.MIN_PERSON_AREA = max(500, int(4000 * res_scale_sq))
@@ -80,13 +84,18 @@ class RuleBasedFallPlugin:
         self.SMOOTH_WINDOW = 5
         self.CRITICAL_KPS  = [5, 6, 11, 12, 13, 14, 15, 16]
 
+        # ── FIX E: hip-rising guard ────────────────────────────────────────
+        self.HIP_RISING_GUARD_PX = 15
+        self.HIP_SMOOTH_WINDOW   = 4
+        self.hip_y_smooth        = defaultdict(list)
+
         # ── Camera auto-detection ─────────────────────────────────────────
         self.AUTO_SAMPLE_DETECTIONS = 80
         self.mode_ratio_samples = defaultdict(list)
         self.mode_angle_samples = defaultdict(list)
         self.camera_mode        = {}
 
-        # ── Per-person state (keyed by (cam_id, track_id)) ─────────────────
+        # ── Per-person state ───────────────────────────────────────────────
         self.prev_hip_y          = {}
         self.prev_time           = {}
         self.velocity_y          = {}
@@ -111,26 +120,35 @@ class RuleBasedFallPlugin:
 
         self.last_seen     = {}
         self.last_alert_ts = {}
-        self.alert_time    = {}  # person_key -> timestamp when HIGH alert fired (for CRITICAL escalation)
+        self.alert_time    = {}
 
-        # ── Per-person severity tracking ───────────────────────────────────
-        self.current_severity = {}   # person_key -> FallSeverity.*
+        self.current_severity = {}
+
+        # ── NEW (v7): overhead + frontal fall history buffers ─────────────
+        # Path C — ceiling camera: tracks bbox area expansion + keypoint spread
+        # Path D — frontal fall:   tracks bbox diagonal growth + centre drop
+        self._overhead_history = {}   # person_key -> deque[(ts, area, spread)]
+        self._frontal_history  = {}   # person_key -> deque[(ts, diag, cy)]
+
+        # ── FPS tracking ──────────────────────────────────────────────────
+        self.fps_times = deque(maxlen=30)
 
         self._debug(
             f"[FallPlugin] frame={frame_width}×{frame_height}  res_scale={res_scale:.3f}\n"
-            f"  DESCENT_VEL_THRESH  = {self.DESCENT_VEL_THRESH:.0f} px/s\n"
-            f"  IMPACT_VEL_THRESH   = {self.IMPACT_VEL_THRESH:.0f} px/s\n"
-            f"  IMPACT_VEL_CAP_COLD = {self.IMPACT_VEL_CAP_COLD:.0f} px/s\n"
-            f"  IMPACT_VEL_CAP_HOT  = {self.IMPACT_VEL_CAP_HOT:.0f} px/s\n"
-            f"  MAX_HIP_JUMP_PX     = {self.MAX_HIP_JUMP_PX:.0f} px\n"
-            f"  EDGE_MARGIN         = {self.EDGE_MARGIN} px\n"
-            f"  MIN_PERSON_AREA     = {self.MIN_PERSON_AREA} px²\n"
-            f"  GROUND_CONFIRM_TIME = {self.GROUND_CONFIRM_TIME:.2f} s  [raised from 0.06]\n"
-            f"  MIN_DESCENT_FRAMES  = {self.MIN_DESCENT_FRAMES}          [raised from 2]\n"
-            f"  PATH_B_RATIO_THRESH = 0.90                [raised from 0.85]\n"
-            f"  EXERCISE_MAX_DROP   = {self.EXERCISE_MAX_PEAK_DROP:.0f} px/s  [tightened from 1200]\n"
-            f"  STREAM_FPS (fixed dt)= {self.STREAM_FPS}\n"
-            f"  overhead_override   = {self.overhead_camera_override}"
+            f"  DESCENT_VEL_THRESH   = {self.DESCENT_VEL_THRESH:.0f} px/s\n"
+            f"  IMPACT_VEL_THRESH    = {self.IMPACT_VEL_THRESH:.0f} px/s\n"
+            f"  IMPACT_VEL_CAP_COLD  = {self.IMPACT_VEL_CAP_COLD:.0f} px/s\n"
+            f"  IMPACT_VEL_CAP_HOT   = {self.IMPACT_VEL_CAP_HOT:.0f} px/s\n"
+            f"  MAX_HIP_JUMP_PX      = {self.MAX_HIP_JUMP_PX:.0f} px\n"
+            f"  EDGE_MARGIN          = {self.EDGE_MARGIN} px\n"
+            f"  MIN_PERSON_AREA      = {self.MIN_PERSON_AREA} px²\n"
+            f"  GROUND_CONFIRM_TIME  = {self.GROUND_CONFIRM_TIME:.2f} s\n"
+            f"  MIN_DESCENT_FRAMES   = {self.MIN_DESCENT_FRAMES}\n"
+            f"  HIP_RISING_GUARD_PX  = {self.HIP_RISING_GUARD_PX} px\n"
+            f"  DT_MIN               = {self.DT_MIN*1000:.1f} ms\n"
+            f"  DT_MAX               = {self.DT_MAX*1000:.0f} ms\n"
+            f"  overhead_override    = {self.overhead_camera_override}\n"
+            f"  [v7] Path C (ceiling) + Path D (frontal) active"
         )
 
     # ──────────────────────────────────────────────────────────────────────
@@ -165,18 +183,19 @@ class RuleBasedFallPlugin:
             return {
                 "IS_UPRIGHT_RATIO":          0.60,
                 "IMPACT_LATCH_CLEAR_RATIO":  0.25,
-                "GROUND_CONFIRM_RATIO":      0.45,  # raised from 0.30 — must be substantially horizontal
+                "GROUND_CONFIRM_RATIO":      0.45,
                 "MIN_FALL_ANGLE_PATH_B":     60,
-                "MIN_TILT_FRAMES_PATH_B":    15,    # raised from 8 — bends/leans resolve faster than falls
+                "MIN_TILT_FRAMES_PATH_B":    15,
                 "HOT_DESCENT_FRAMES":        5,
                 "EXERCISE_MIN_RATIO_FRAMES": 10,
             }
         return {
             "IS_UPRIGHT_RATIO":          0.52,
             "IMPACT_LATCH_CLEAR_RATIO":  0.30,
-            "GROUND_CONFIRM_RATIO":      0.50,  # raised from 0.30 — must be substantially horizontal
+            "GROUND_CONFIRM_RATIO":      0.50,
+            "PATH_B_RATIO_THRESH":       0.80,
             "MIN_FALL_ANGLE_PATH_B":     25,
-            "MIN_TILT_FRAMES_PATH_B":    12,    # raised from 6 — bends/leans resolve faster than falls
+            "MIN_TILT_FRAMES_PATH_B":    12,
             "HOT_DESCENT_FRAMES":        3,
             "EXERCISE_MIN_RATIO_FRAMES": 15,
         }
@@ -226,13 +245,12 @@ class RuleBasedFallPlugin:
         elapsed  = time.time() - t_start
 
         no_spike      = max_drop    < self.EXERCISE_MAX_PEAK_DROP
-        took_long     = elapsed     > self.EXERCISE_SLOW_DESCENT_TIME
         gradual_ratio = frame_count > exercise_min_ratio_frames
 
-        if frame_count > 25 and elapsed > 1.0:
+        if frame_count > 25 and elapsed > 1.0 and no_spike:
             self._debug(
                 f"{person_key} 🪑 SEATED SUPPRESSION "
-                f"(frames={frame_count} elapsed={elapsed:.2f}s)"
+                f"(frames={frame_count} elapsed={elapsed:.2f}s max_drop={max_drop:.0f})"
             )
             return True
 
@@ -250,6 +268,95 @@ class RuleBasedFallPlugin:
             )
             return True
         return False
+
+    # ── NEW (v7): Path C — ceiling/overhead camera ─────────────────────────
+    def _compute_overhead_signals(self, person_key, kps_xy, bbox, dt, now_ts):
+        """
+        For ceiling cameras hip Y velocity is useless — the person falls
+        *away* from the lens.  Instead we watch:
+
+        1. BBOX AREA EXPANSION RATE
+           Standing from above → small bbox.  Lying on floor → large wide bbox.
+           Rapid expansion = fall impact.
+
+        2. KEYPOINT SPREAD (std-dev of all visible keypoints)
+           Upright: keypoints clustered.  On impact: limbs splay outward.
+
+        Returns {"area_rate", "spread_rate", "fired"}
+        """
+        x1, y1, x2, y2 = bbox
+        area_now = float((x2 - x1) * (y2 - y1))
+
+        xs, ys = kps_xy[:, 0], kps_xy[:, 1]
+        valid  = (xs > 0) & (ys > 0)
+        spread = float(np.std(kps_xy[valid])) if valid.sum() > 3 else 0.0
+
+        history = self._overhead_history.setdefault(person_key, deque(maxlen=6))
+        history.append((now_ts, area_now, spread))
+
+        if len(history) < 3:
+            return {"area_rate": 0.0, "spread_rate": 0.0, "fired": False}
+
+        t0, area0, spread0 = history[0]
+        elapsed = max(now_ts - t0, dt)
+
+        area_rate   = (area_now - area0)  / elapsed
+        spread_rate = (spread   - spread0) / elapsed
+
+        AREA_RATE_THRESH   = 30_000.0 * (self.frame_width / self.REF_WIDTH)
+        SPREAD_RATE_THRESH =     60.0 * (self.frame_width / self.REF_WIDTH)
+
+        fired = (area_rate > AREA_RATE_THRESH) or (spread_rate > SPREAD_RATE_THRESH)
+
+        if self.debug and fired:
+            print(
+                f"[OverheadFix] Path-C FIRED person={person_key} "
+                f"area_rate={area_rate:.0f} spread_rate={spread_rate:.1f}",
+                flush=True,
+            )
+
+        return {"area_rate": area_rate, "spread_rate": spread_rate, "fired": fired}
+
+    # ── NEW (v7): Path D — frontal fall (person falls toward camera) ────────
+    def _compute_frontal_signals(self, person_key, bbox, dt, now_ts):
+        """
+        When someone falls toward the camera their bbox diagonal grows rapidly
+        AND the bbox centre drops (head pitching forward/down).
+
+        Both conditions must fire together to avoid false positives from
+        someone simply walking toward the camera.
+
+        Returns {"diag_rate", "centre_drop", "fired"}
+        """
+        x1, y1, x2, y2 = bbox
+        diag = float(np.hypot(x2 - x1, y2 - y1))
+        cy   = float((y1 + y2) / 2.0)
+
+        history = self._frontal_history.setdefault(person_key, deque(maxlen=6))
+        history.append((now_ts, diag, cy))
+
+        if len(history) < 3:
+            return {"diag_rate": 0.0, "centre_drop": 0.0, "fired": False}
+
+        t0, diag0, cy0 = history[0]
+        elapsed = max(now_ts - t0, dt)
+
+        diag_rate   = (diag - diag0) / elapsed
+        centre_drop = (cy   - cy0)   / elapsed   # positive = moving down
+
+        DIAG_RATE_THRESH   = 400.0 * (self.frame_width / self.REF_WIDTH)
+        CENTRE_DROP_THRESH =  60.0 * (self.frame_width / self.REF_WIDTH)
+
+        fired = (diag_rate > DIAG_RATE_THRESH) and (centre_drop > CENTRE_DROP_THRESH)
+
+        if self.debug and fired:
+            print(
+                f"[FrontalFix] Path-D FIRED person={person_key} "
+                f"diag_rate={diag_rate:.0f} centre_drop={centre_drop:.1f}",
+                flush=True,
+            )
+
+        return {"diag_rate": diag_rate, "centre_drop": centre_drop, "fired": fired}
 
     def _cleanup_stale_tracks(self, now_ts: float, ttl: float = 2.0):
         stale = [k for k, t in self.last_seen.items() if (now_ts - t) > ttl]
@@ -273,18 +380,13 @@ class RuleBasedFallPlugin:
             self.falling_ids.discard(k)
             self.current_severity.pop(k, None)
             self.alert_time.pop(k, None)
+            self.hip_y_smooth.pop(k, None)
+            # NEW (v7): clear overhead + frontal buffers
+            self._overhead_history.pop(k, None)
+            self._frontal_history.pop(k, None)
             self.last_seen.pop(k, None)
 
     def _compute_severity(self, person_key) -> str:
-        """
-        Derive fall severity for a person from current pipeline state.
-
-        CRITICAL – HIGH alert already fired AND person has remained on the ground
-                   for ≥ CRITICAL_GROUND_TIME seconds since the alert.
-        HIGH     – Impact latched AND ground confirmation accumulated.
-        MEDIUM   – Descent counter at threshold OR impact latched but ground not yet confirmed.
-        LOW      – None of the above.
-        """
         descent_ok = self.descent_counter[person_key] >= self.MIN_DESCENT_FRAMES
         impact_ok  = self.impact_detected[person_key]
         ground_ok  = self.ground_confirm_accum[person_key] >= self.GROUND_CONFIRM_TIME
@@ -305,10 +407,6 @@ class RuleBasedFallPlugin:
     # ──────────────────────────────────────────────────────────────────────
 
     def get_severity(self, cam_id: str, track_id) -> str:
-        """
-        Return the current FallSeverity for a specific tracked person.
-        Returns FallSeverity.LOW if the person is not being tracked.
-        """
         return self.current_severity.get((cam_id, track_id), FallSeverity.LOW)
 
     def process_batch(self, scene_state: dict) -> list:
@@ -317,9 +415,9 @@ class RuleBasedFallPlugin:
             cam_id: {
                 "tracked_people": {
                     track_id: {
-                        "bbox":       [x1,y1,x2,y2],   # pixel coords
+                        "bbox":       [x1,y1,x2,y2],
                         "confidence": float,
-                        "keypoints":  array[17,2|3],    # xy or xyc
+                        "keypoints":  array[17,2|3],
                         # optional:
                         "frame_width":  int,
                         "frame_height": int,
@@ -328,18 +426,28 @@ class RuleBasedFallPlugin:
             }
         }
 
-        Returns list of alert dicts. Each alert now includes a "severity" field:
+        Returns list of alert dicts:
             {
                 "cameraId":   str,
                 "trackId":    any,
                 "eventType":  "fall",
                 "confidence": float,
-                "severity":   "HIGH" | "MEDIUM" | "LOW",
+                "severity":   "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
             }
 
-        Severity is also updated continuously on self.current_severity so
-        callers can poll it between alerts via get_severity().
+        Fall detection paths (v7):
+            Path A — velocity spike (side/front cameras, fast fall)
+            Path B — body goes horizontal + tilt angle (front camera, sideways fall)
+            Path C — bbox area + keypoint spread (ceiling/overhead camera)   ← NEW
+            Path D — bbox diagonal growth + centre drop (frontal fall)        ← NEW
         """
+        # ── FPS tracking ──────────────────────────────────────────────────
+        self.fps_times.append(time.time())
+        if len(self.fps_times) == 30:
+            fps = 30 / (self.fps_times[-1] - self.fps_times[0])
+            print(f"[FPS] {fps:.1f}", flush=True)
+        # ──────────────────────────────────────────────────────────────────
+
         alerts     = []
         now_global = time.time()
 
@@ -354,7 +462,6 @@ class RuleBasedFallPlugin:
                 conf    = float(person.get("confidence", 0.0))
                 kps_raw = person.get("keypoints")
 
-                # ── Allow per-person frame-size override ───────────────────
                 fw = int(person.get("frame_width",  self.frame_width))
                 fh = int(person.get("frame_height", self.frame_height))
 
@@ -367,30 +474,20 @@ class RuleBasedFallPlugin:
 
                 # ── Basic validity checks ──────────────────────────────────
                 if bbox is None:
-                    self._debug(f"[FallPlugin] SKIP cam={cam_id} id={track_id} — bbox is None")
                     self.current_severity[person_key] = FallSeverity.LOW
                     continue
 
                 if conf < self.conf_threshold:
-                    self._debug(
-                        f"[FallPlugin] SKIP cam={cam_id} id={track_id} "
-                        f"— conf {conf:.2f} < {self.conf_threshold}"
-                    )
                     self.current_severity[person_key] = FallSeverity.LOW
                     continue
 
                 if kps_raw is None:
-                    self._debug(f"[FallPlugin] SKIP cam={cam_id} id={track_id} — keypoints is None")
                     self.current_severity[person_key] = FallSeverity.LOW
                     continue
 
                 kps = np.array(kps_raw, dtype=float)
 
                 if kps.ndim != 2 or kps.shape[0] < 17:
-                    self._debug(
-                        f"[FallPlugin] SKIP cam={cam_id} id={track_id} "
-                        f"— bad kps shape {kps.shape}"
-                    )
                     self.current_severity[person_key] = FallSeverity.LOW
                     continue
 
@@ -401,10 +498,6 @@ class RuleBasedFallPlugin:
                     kps_conf      = kps[:, 2]
                     critical_conf = float(np.mean(kps_conf[self.CRITICAL_KPS]))
                     if critical_conf < self.KP_CONF_THRESH:
-                        self._debug(
-                            f"[FallPlugin] SKIP cam={cam_id} id={track_id} "
-                            f"— critical kp conf {critical_conf:.2f} < {self.KP_CONF_THRESH}"
-                        )
                         self.current_severity[person_key] = FallSeverity.LOW
                         continue
                 else:
@@ -412,10 +505,6 @@ class RuleBasedFallPlugin:
                     ys    = kps_xy[:, 1]
                     valid = (xs > 0) & (ys > 0)
                     if int(valid.sum()) < 8:
-                        self._debug(
-                            f"[FallPlugin] SKIP cam={cam_id} id={track_id} "
-                            f"— only {int(valid.sum())} valid kps (need 8)"
-                        )
                         self.current_severity[person_key] = FallSeverity.LOW
                         continue
 
@@ -426,19 +515,11 @@ class RuleBasedFallPlugin:
                 em = self.EDGE_MARGIN
 
                 if cx < em or cx > fw - em or cy < em or cy > fh - em:
-                    self._debug(
-                        f"[FallPlugin] SKIP cam={cam_id} id={track_id} "
-                        f"— frame-edge ghost (cx={cx:.0f} cy={cy:.0f})"
-                    )
                     self.current_severity[person_key] = FallSeverity.LOW
                     continue
 
                 bbox_area = (x2b - x1b) * (y2b - y1b)
                 if bbox_area < self.MIN_PERSON_AREA:
-                    self._debug(
-                        f"[FallPlugin] SKIP cam={cam_id} id={track_id} "
-                        f"— bbox too small ({bbox_area:.0f} px²)"
-                    )
                     self.current_severity[person_key] = FallSeverity.LOW
                     continue
 
@@ -458,17 +539,42 @@ class RuleBasedFallPlugin:
                     self.mode_angle_samples[cam_id].append(torso_angle)
                     self._maybe_finalize_camera_mode(cam_id)
 
+                if cam_id not in self.camera_mode:
+                    self._debug(
+                        f"[FallPlugin] cam={cam_id} mode not yet locked "
+                        f"({len(self.mode_ratio_samples[cam_id])}/{self.AUTO_SAMPLE_DETECTIONS} samples)"
+                        f" — using side-view defaults"
+                    )
+
                 thresholds                = self._camera_thresholds(cam_id)
                 hot_descent_frames        = thresholds["HOT_DESCENT_FRAMES"]
                 exercise_min_ratio_frames = thresholds["EXERCISE_MIN_RATIO_FRAMES"]
                 is_overhead               = self.camera_mode.get(cam_id, False)
                 is_upright                = body_ratio < thresholds["IS_UPRIGHT_RATIO"]
 
+                path_b_ratio_thresh = thresholds.get(
+                    "PATH_B_RATIO_THRESH",
+                    0.90 if is_overhead else 0.80
+                )
+
                 # ── Hip velocity ───────────────────────────────────────────
-                hip_mid_y = float((kps_xy[11][1] + kps_xy[12][1]) / 2.0)
-                now_ts    = time.time()
-                prev_t    = self.prev_time.get(person_key, now_ts)
-                dt        = 1.0 / self.STREAM_FPS
+                hip_mid_y_raw = float((kps_xy[11][1] + kps_xy[12][1]) / 2.0)
+
+                hip_buf = self.hip_y_smooth[person_key]
+                hip_buf.append(hip_mid_y_raw)
+                if len(hip_buf) > self.HIP_SMOOTH_WINDOW:
+                    hip_buf.pop(0)
+                hip_mid_y = float(np.mean(hip_buf))
+
+                now_ts = time.time()
+                prev_t = self.prev_time.get(person_key, now_ts)
+
+                raw_dt = now_ts - prev_t
+                if raw_dt <= 0 or raw_dt > self.DT_MAX:
+                    dt = 1.0 / self.STREAM_FPS
+                else:
+                    dt = max(raw_dt, self.DT_MIN)
+
                 self.prev_time[person_key] = now_ts
 
                 if person_key not in self.prev_hip_y:
@@ -481,31 +587,17 @@ class RuleBasedFallPlugin:
                 # ── Hip-jump guard ─────────────────────────────────────────
                 hip_jump = abs(hip_mid_y - prev_hip)
                 if hip_jump > self.MAX_HIP_JUMP_PX:
-                    baseline_locked = self.is_baseline_locked.get(person_key, False)
-                    if not baseline_locked:
-                        self._debug(
-                            f"[FallPlugin] SKIP cam={cam_id} id={track_id} "
-                            f"— pre-baseline hip jump ({hip_jump:.1f} px)"
-                        )
+                    if not self.is_baseline_locked.get(person_key, False):
                         self.prev_hip_y[person_key] = hip_mid_y
                         self.velocity_y[person_key] = 0.0
                         self.current_severity[person_key] = FallSeverity.LOW
                         continue
-                    else:
-                        self._debug(
-                            f"[FallPlugin] LARGE hip drop cam={cam_id} id={track_id} "
-                            f"({hip_jump:.1f} px) — processing"
-                        )
 
                 raw_drop = (hip_mid_y - prev_hip) / dt
                 self.prev_hip_y[person_key] = hip_mid_y
 
                 cap = self._velocity_cap(person_key, hot_descent_frames)
                 if raw_drop > cap:
-                    self._debug(
-                        f"[FallPlugin] CLAMP cam={cam_id} id={track_id} "
-                        f"raw_drop={raw_drop:.0f} > cap={cap:.0f} — zeroed"
-                    )
                     drop = 0.0
                 elif raw_drop < 0:
                     drop = 0.0
@@ -521,12 +613,6 @@ class RuleBasedFallPlugin:
                     f"descent={self.descent_counter[person_key]} "
                     f"impact={self.impact_detected[person_key]} "
                     f"baseline_locked={self.is_baseline_locked.get(person_key, False)}"
-                )
-
-                self._debug(
-                    f"[CHECK] descent={self.descent_counter[person_key]} "
-                    f"impact={self.impact_detected[person_key]} "
-                    f"ground={self.ground_confirm_accum[person_key]:.3f}"
                 )
 
                 # ══════════════════════════════════════════════════════════
@@ -570,7 +656,6 @@ class RuleBasedFallPlugin:
                         self.tilt_start_time[person_key]  = now_ts
                         self.all_drop_history[person_key] = deque(maxlen=self.PEAK_DROP_WINDOW)
                         self.tilt_frame_count[person_key] = 0
-                        self._debug(f"[FallPlugin] tilt clock started cam={cam_id} id={track_id}")
 
                     if person_key in self.tilt_start_time:
                         self.tilt_frame_count[person_key] = min(
@@ -585,7 +670,6 @@ class RuleBasedFallPlugin:
                 cool_start = self.cooldown_timer.get(person_key)
                 if cool_start is not None:
                     if (now_ts - cool_start) < self.RECOVERY_COOLDOWN:
-                        self._debug(f"[FallPlugin] in cooldown cam={cam_id} id={track_id}")
                         self.current_severity[person_key] = FallSeverity.LOW
                         continue
                     else:
@@ -606,20 +690,37 @@ class RuleBasedFallPlugin:
                     self.falling_ids.discard(person_key)
                     if not self.impact_detected[person_key]:
                         self.current_severity[person_key] = FallSeverity.LOW
-                        continue
+                        # NOTE: we still run Path C / D below even without descent,
+                        # because overhead/frontal falls produce little hip Y motion.
+                        # Only skip if impact is also not yet detected.
+                        if not is_overhead:
+                            # For overhead cameras skip the continue so Path C can fire.
+                            # For side/front cameras without enough descent, only Path D
+                            # (frontal) might still be valid — let it through too.
+                            pass
+                        # Fall through to Path C / D checks below instead of hard continue.
+                        # We use a flag to suppress Path A / B if descent not met.
+                        skip_velocity_paths = True
+                    else:
+                        skip_velocity_paths = False
                 else:
                     self.falling_ids.add(person_key)
+                    skip_velocity_paths = False
 
                 # ══════════════════════════════════════════════════════════
                 # 5️⃣  IMPACT DETECTION
+                #     Path A — velocity spike
+                #     Path B — body goes horizontal (front cam, sideways fall)
+                #     Path C — NEW: ceiling/overhead expansion
+                #     Path D — NEW: frontal fall (bbox grows + centre drops)
                 # ══════════════════════════════════════════════════════════
                 if not self.impact_detected[person_key]:
                     ratio_now   = body_ratio
                     tilt_frames = self.tilt_frame_count[person_key]
                     current_cap = self._velocity_cap(person_key, hot_descent_frames)
 
-                    # Path A — velocity spike
-                    if self.IMPACT_VEL_THRESH < drop <= current_cap:
+                    # ── Path A — velocity spike ────────────────────────────
+                    if not skip_velocity_paths and self.IMPACT_VEL_THRESH < drop <= current_cap:
                         path_a_blocked = False
 
                         if is_overhead:
@@ -630,21 +731,18 @@ class RuleBasedFallPlugin:
                             )
                             if seated_at_spike or long_seated_ctx:
                                 path_a_blocked = True
-                                self._debug(
-                                    f"[FallPlugin] Path-A BLOCKED (seated) "
-                                    f"cam={cam_id} id={track_id}"
-                                )
 
                         if not path_a_blocked:
                             self._latch_impact(person_key, now_ts)
                             self._debug(
-                                f"[FallPlugin] 💥 IMPACT-VELOCITY cam={cam_id} id={track_id} "
-                                f"drop={drop:.0f} cap={current_cap:.0f}"
+                                f"[FallPlugin] 💥 IMPACT-VELOCITY (Path A) "
+                                f"cam={cam_id} id={track_id} drop={drop:.0f}"
                             )
 
-                    # Path B — body horizontal + torso angle + tilt frames + enough descent
+                    # ── Path B — body horizontal + tilt (front cam, sideways fall)
                     elif (
-                        ratio_now > 0.90                                        # raised from 0.85 — stricter horizontal check
+                        not skip_velocity_paths
+                        and ratio_now > path_b_ratio_thresh
                         and torso_angle >= thresholds["MIN_FALL_ANGLE_PATH_B"]
                         and tilt_frames >= thresholds["MIN_TILT_FRAMES_PATH_B"]
                         and self.descent_counter[person_key] >= self.MIN_DESCENT_FRAMES
@@ -656,89 +754,118 @@ class RuleBasedFallPlugin:
                         else:
                             self._latch_impact(person_key, now_ts)
                             self._debug(
-                                f"[FallPlugin] 💥 IMPACT-RATIO cam={cam_id} id={track_id} "
-                                f"ratio={ratio_now:.2f} angle={torso_angle:.1f} frames={tilt_frames}"
+                                f"[FallPlugin] 💥 IMPACT-RATIO (Path B) "
+                                f"cam={cam_id} id={track_id} "
+                                f"ratio={ratio_now:.2f} angle={torso_angle:.1f} "
+                                f"frames={tilt_frames}"
                             )
+
+                    # ── Path C — ceiling/overhead: area expansion + kp spread ──
+                    if is_overhead and not self.impact_detected[person_key]:
+                        oh = self._compute_overhead_signals(
+                            person_key, kps_xy, bbox, dt, now_ts
+                        )
+                        if oh["fired"]:
+                            self._latch_impact(person_key, now_ts)
+                            self._debug(
+                                f"[FallPlugin] 💥 IMPACT-OVERHEAD (Path C) "
+                                f"cam={cam_id} id={track_id} "
+                                f"area_rate={oh['area_rate']:.0f} "
+                                f"spread_rate={oh['spread_rate']:.1f}"
+                            )
+
+                    # ── Path D — frontal: bbox diagonal growth + centre drop ────
+                    # Runs for ALL non-overhead cameras (side and front views).
+                    # Requires both diag growth AND centre drop to avoid false
+                    # positives from someone simply walking toward the lens.
+                    if not is_overhead and not self.impact_detected[person_key]:
+                        fr = self._compute_frontal_signals(
+                            person_key, bbox, dt, now_ts
+                        )
+                        if fr["fired"]:
+                            self._latch_impact(person_key, now_ts)
+                            self._debug(
+                                f"[FallPlugin] 💥 IMPACT-FRONTAL (Path D) "
+                                f"cam={cam_id} id={track_id} "
+                                f"diag_rate={fr['diag_rate']:.0f} "
+                                f"centre_drop={fr['centre_drop']:.1f}"
+                            )
+
+                # ── If still no impact after all paths, bail out ───────────
+                if not self.impact_detected[person_key]:
+                    if skip_velocity_paths:
+                        self.current_severity[person_key] = FallSeverity.LOW
+                    continue
 
                 # ══════════════════════════════════════════════════════════
                 # 6️⃣  GROUND CONFIRMATION
                 # ══════════════════════════════════════════════════════════
-                if self.impact_detected[person_key]:
+                inertia_elapsed = now_ts - self.inertia_timer.get(person_key, now_ts)
+                if (
+                    body_ratio < thresholds["IMPACT_LATCH_CLEAR_RATIO"]
+                    and inertia_elapsed > self.INERTIA_TIME
+                ):
+                    self.impact_detected[person_key]      = False
+                    self.descent_counter[person_key]      = 0
+                    self.ground_confirm_accum[person_key] = 0.0
+                    self.alert_time.pop(person_key, None)
+                    self.current_severity[person_key] = FallSeverity.LOW
+                    continue
 
-                    inertia_elapsed = now_ts - self.inertia_timer.get(person_key, now_ts)
-                    if (
-                        body_ratio < thresholds["IMPACT_LATCH_CLEAR_RATIO"]
-                        and inertia_elapsed > self.INERTIA_TIME
-                    ):
-                        self.impact_detected[person_key]      = False
-                        self.descent_counter[person_key]      = 0
+                if body_ratio > thresholds["GROUND_CONFIRM_RATIO"]:
+                    hip_rising = (hip_mid_y < prev_hip - self.HIP_RISING_GUARD_PX)
+                    if hip_rising:
                         self.ground_confirm_accum[person_key] = 0.0
                         self._debug(
-                            f"[FallPlugin] stood up, impact cleared "
-                            f"(ratio={body_ratio:.2f}) cam={cam_id} id={track_id}"
+                            f"[FallPlugin] hip rising (>{self.HIP_RISING_GUARD_PX}px), "
+                            f"ground accum reset cam={cam_id} id={track_id}"
                         )
-                        self.alert_time.pop(person_key, None)
-                        self.current_severity[person_key] = FallSeverity.LOW
-                        continue
+                    else:
+                        self.ground_confirm_accum[person_key] += dt
 
-                    if body_ratio > thresholds["GROUND_CONFIRM_RATIO"]:
-                        # Hip-rising guard: if hip is moving upward the person is
-                        # standing back up — reset accumulation instead of counting
-                        hip_rising = (hip_mid_y < prev_hip - 5)
-                        if hip_rising:
-                            self.ground_confirm_accum[person_key] = 0.0
-                            self._debug(
-                                f"[FallPlugin] hip rising, ground accum reset "
-                                f"cam={cam_id} id={track_id}"
-                            )
-                        else:
-                            self.ground_confirm_accum[person_key] += dt
+                self._debug(
+                    f"[FallPlugin] GROUND_DEBUG cam={cam_id} id={track_id} "
+                    f"accum={self.ground_confirm_accum[person_key]:.3f}s "
+                    f"ratio={body_ratio:.2f} "
+                    f"(confirm when accum>{self.GROUND_CONFIRM_TIME} "
+                    f"& ratio>{thresholds['GROUND_CONFIRM_RATIO']})"
+                )
 
-                    self._debug(
-                        f"[FallPlugin] GROUND_DEBUG cam={cam_id} id={track_id} "
-                        f"accum={self.ground_confirm_accum[person_key]:.3f}s "
-                        f"ratio={body_ratio:.2f} "
-                        f"(confirm when accum>{self.GROUND_CONFIRM_TIME} "
-                        f"& ratio>{thresholds['GROUND_CONFIRM_RATIO']})"
-                    )
+                self.current_severity[person_key] = self._compute_severity(person_key)
 
-                    # ── Update severity before checking confirmation ────────
-                    self.current_severity[person_key] = self._compute_severity(person_key)
+                if self.ground_confirm_accum[person_key] >= self.GROUND_CONFIRM_TIME:
+                    last_alert = self.last_alert_ts.get(person_key, 0.0)
+                    if (now_ts - last_alert) >= self.RECOVERY_COOLDOWN:
+                        severity = FallSeverity.HIGH
+                        self.current_severity[person_key] = severity
+                        self.alert_time[person_key]       = now_ts
+                        print(
+                            f"⚠️  Fall confirmed cam={cam_id} track={track_id} "
+                            f"severity={severity} "
+                            f"(conf={conf:.2f} ratio={body_ratio:.2f})",
+                            flush=True,
+                        )
+                        alerts.append({
+                            "cameraId":   cam_id,
+                            "trackId":    track_id,
+                            "eventType":  "fall",
+                            "confidence": conf,
+                            "severity":   severity,
+                        })
+                        self.last_alert_ts[person_key] = now_ts
 
-                    if self.ground_confirm_accum[person_key] >= self.GROUND_CONFIRM_TIME:
-                        last_alert = self.last_alert_ts.get(person_key, 0.0)
-                        if (now_ts - last_alert) >= self.RECOVERY_COOLDOWN:
-                            severity = FallSeverity.HIGH
-                            self.current_severity[person_key] = severity
-                            self.alert_time[person_key]       = now_ts  # start CRITICAL escalation clock
-                            print(
-                                f"⚠️  Fall confirmed cam={cam_id} track={track_id} "
-                                f"severity={severity} "
-                                f"(conf={conf:.2f} ratio={body_ratio:.2f})",
-                                flush=True,
-                            )
-                            alerts.append({
-                                "cameraId":   cam_id,
-                                "trackId":    track_id,
-                                "eventType":  "fall",
-                                "confidence": conf,
-                                "severity":   severity,
-                            })
-                            self.last_alert_ts[person_key] = now_ts
+                    self.cooldown_timer[person_key]       = now_ts
+                    self.impact_detected[person_key]      = False
+                    self.descent_counter[person_key]      = 0
+                    self.ground_confirm_accum[person_key] = 0.0
+                    self.falling_ids.discard(person_key)
+                    continue
 
-                        self.cooldown_timer[person_key]       = now_ts
-                        self.impact_detected[person_key]      = False
-                        self.descent_counter[person_key]      = 0
-                        self.ground_confirm_accum[person_key] = 0.0
-                        self.falling_ids.discard(person_key)
-                        continue
-
-                # ── CRITICAL escalation: person still on ground ≥ CRITICAL_GROUND_TIME ──
+                # ── CRITICAL escalation ────────────────────────────────────
                 alert_ts = self.alert_time.get(person_key)
                 if alert_ts is not None and not self.impact_detected[person_key]:
                     time_on_ground = now_ts - alert_ts
                     if time_on_ground >= self.CRITICAL_GROUND_TIME:
-                        # Only fire once per RECOVERY_COOLDOWN window
                         last_crit = self.last_alert_ts.get(person_key, 0.0)
                         if (now_ts - last_crit) >= self.RECOVERY_COOLDOWN:
                             self.current_severity[person_key] = FallSeverity.CRITICAL
@@ -757,10 +884,8 @@ class RuleBasedFallPlugin:
                             })
                             self.last_alert_ts[person_key] = now_ts
 
-                # ── Severity update for non-impact / mid-pipeline states ───
                 self.current_severity[person_key] = self._compute_severity(person_key)
 
-                # ── Quick-recovery: very upright + small angle ─────────────
                 if body_ratio < 0.40 and torso_angle < self.UPRIGHT_ANGLE:
                     self.descent_counter[person_key] = 0
                     self.current_severity[person_key] = FallSeverity.LOW
