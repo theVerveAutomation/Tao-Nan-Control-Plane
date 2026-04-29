@@ -37,7 +37,7 @@ class RuleBasedFallPlugin:
         frame_height: int = 540,
         debug: bool = False,
     ):
-        print("⚡ Initializing Fall Detection Plugin (Advanced Rule-Based v7 — all cameras)...")
+        print("⚡ Initializing Fall Detection Plugin (Advanced Rule-Based v7 — all cameras, low-FPS optimised)...")
 
         self.conf_threshold           = confidence_threshold
         self.overhead_camera_override = overhead_camera_override
@@ -54,15 +54,17 @@ class RuleBasedFallPlugin:
         self.UPRIGHT_ANGLE        = 18
         self.GROUND_CONFIRM_TIME  = 0.5
         self.CRITICAL_GROUND_TIME = 3.0
-        self.MIN_DESCENT_FRAMES   = 3
+        # FIX (low-FPS): reduced from 3 → 1 so a single frame is enough to
+        # register descent at 1–2 FPS where 3 consecutive frames = ~2 s.
+        self.MIN_DESCENT_FRAMES   = 1
         self.RECOVERY_COOLDOWN    = 5.0
         self.INERTIA_TIME         = 0.6
         self.KP_CONF_THRESH       = 0.30
-        self.STREAM_FPS           = 25.0
 
-        # ── FIX A: dt bounds ──────────────────────────────────────────────
-        self.DT_MIN = 1.0 / 60.0
-        self.DT_MAX = 1.0 / 8.0
+        # ── FIX A: dt bounds (replaces hardcoded STREAM_FPS) ──────────────
+        # dt is clamped to real wall-clock time; no FPS assumption needed.
+        self.DT_MIN = 1.0 / 60.0   # 16.7 ms  — prevents division by near-zero
+        self.DT_MAX = 1.0 / 8.0    # 125  ms  — caps outlier gaps (re-ID, pause)
 
         # ── Velocity thresholds ────────────────────────────────────────────
         self.DESCENT_VEL_THRESH   = 90.0    * res_scale
@@ -81,12 +83,14 @@ class RuleBasedFallPlugin:
         self.MIN_PERSON_AREA = max(500, int(4000 * res_scale_sq))
 
         # ── Smoothing ─────────────────────────────────────────────────────
-        self.SMOOTH_WINDOW = 5
-        self.CRITICAL_KPS  = [5, 6, 11, 12, 13, 14, 15, 16]
+        # FIX (low-FPS): reduced windows from 5→2 and 4→2.
+        # At 1.7 FPS, window=5 spans ~3 s which is too much lag.
+        self.SMOOTH_WINDOW     = 2   # was 5
+        self.HIP_SMOOTH_WINDOW = 2   # was 4
+        self.CRITICAL_KPS      = [5, 6, 11, 12, 13, 14, 15, 16]
 
         # ── FIX E: hip-rising guard ────────────────────────────────────────
         self.HIP_RISING_GUARD_PX = 15
-        self.HIP_SMOOTH_WINDOW   = 4
         self.hip_y_smooth        = defaultdict(list)
 
         # ── Camera auto-detection ─────────────────────────────────────────
@@ -124,7 +128,9 @@ class RuleBasedFallPlugin:
 
         self.current_severity = {}
 
-        # ── NEW (v7): overhead + frontal fall history buffers ─────────────
+        # ── v7: overhead + frontal fall history buffers ───────────────────
+        # FIX (low-FPS): maxlen reduced from 6 → 3.
+        # At 1.7 FPS, maxlen=6 spans 3.5 s — way too long a history window.
         # Path C — ceiling camera: tracks bbox area expansion + keypoint spread
         # Path D — frontal fall:   tracks bbox diagonal growth + centre drop
         self._overhead_history = {}   # person_key -> deque[(ts, area, spread)]
@@ -143,12 +149,15 @@ class RuleBasedFallPlugin:
             f"  EDGE_MARGIN          = {self.EDGE_MARGIN} px\n"
             f"  MIN_PERSON_AREA      = {self.MIN_PERSON_AREA} px²\n"
             f"  GROUND_CONFIRM_TIME  = {self.GROUND_CONFIRM_TIME:.2f} s\n"
-            f"  MIN_DESCENT_FRAMES   = {self.MIN_DESCENT_FRAMES}\n"
+            f"  MIN_DESCENT_FRAMES   = {self.MIN_DESCENT_FRAMES}  ← low-FPS fix\n"
+            f"  SMOOTH_WINDOW        = {self.SMOOTH_WINDOW}  ← low-FPS fix\n"
+            f"  HIP_SMOOTH_WINDOW    = {self.HIP_SMOOTH_WINDOW}  ← low-FPS fix\n"
             f"  HIP_RISING_GUARD_PX  = {self.HIP_RISING_GUARD_PX} px\n"
-            f"  DT_MIN               = {self.DT_MIN*1000:.1f} ms\n"
+            f"  DT_MIN               = {self.DT_MIN*1000:.1f} ms  ← replaces STREAM_FPS\n"
             f"  DT_MAX               = {self.DT_MAX*1000:.0f} ms\n"
             f"  overhead_override    = {self.overhead_camera_override}\n"
-            f"  [v7] Path C (ceiling) + Path D (frontal) active"
+            f"  [v7] Path C (ceiling) + Path D (frontal) active\n"
+            f"  [v7] history buffers maxlen=3  ← low-FPS fix"
         )
 
     # ──────────────────────────────────────────────────────────────────────
@@ -269,7 +278,7 @@ class RuleBasedFallPlugin:
             return True
         return False
 
-    # ── NEW (v7): Path C — ceiling/overhead camera ─────────────────────────
+    # ── v7: Path C — ceiling/overhead camera ──────────────────────────────
     def _compute_overhead_signals(self, person_key, kps_xy, bbox, dt, now_ts):
         """
         For ceiling cameras hip Y velocity is useless — the person falls
@@ -291,7 +300,8 @@ class RuleBasedFallPlugin:
         valid  = (xs > 0) & (ys > 0)
         spread = float(np.std(kps_xy[valid])) if valid.sum() > 3 else 0.0
 
-        history = self._overhead_history.setdefault(person_key, deque(maxlen=6))
+        # FIX (low-FPS): maxlen reduced 6 → 3
+        history = self._overhead_history.setdefault(person_key, deque(maxlen=3))
         history.append((now_ts, area_now, spread))
 
         if len(history) < 3:
@@ -317,7 +327,7 @@ class RuleBasedFallPlugin:
 
         return {"area_rate": area_rate, "spread_rate": spread_rate, "fired": fired}
 
-    # ── NEW (v7): Path D — frontal fall (person falls toward camera) ────────
+    # ── v7: Path D — frontal fall (person falls toward camera) ─────────────
     def _compute_frontal_signals(self, person_key, bbox, dt, now_ts):
         """
         When someone falls toward the camera their bbox diagonal grows rapidly
@@ -332,7 +342,8 @@ class RuleBasedFallPlugin:
         diag = float(np.hypot(x2 - x1, y2 - y1))
         cy   = float((y1 + y2) / 2.0)
 
-        history = self._frontal_history.setdefault(person_key, deque(maxlen=6))
+        # FIX (low-FPS): maxlen reduced 6 → 3
+        history = self._frontal_history.setdefault(person_key, deque(maxlen=3))
         history.append((now_ts, diag, cy))
 
         if len(history) < 3:
@@ -381,7 +392,6 @@ class RuleBasedFallPlugin:
             self.current_severity.pop(k, None)
             self.alert_time.pop(k, None)
             self.hip_y_smooth.pop(k, None)
-            # NEW (v7): clear overhead + frontal buffers
             self._overhead_history.pop(k, None)
             self._frontal_history.pop(k, None)
             self.last_seen.pop(k, None)
@@ -438,8 +448,8 @@ class RuleBasedFallPlugin:
         Fall detection paths (v7):
             Path A — velocity spike (side/front cameras, fast fall)
             Path B — body goes horizontal + tilt angle (front camera, sideways fall)
-            Path C — bbox area + keypoint spread (ceiling/overhead camera)   ← NEW
-            Path D — bbox diagonal growth + centre drop (frontal fall)        ← NEW
+            Path C — bbox area + keypoint spread (ceiling/overhead camera)
+            Path D — bbox diagonal growth + centre drop (frontal fall)
         """
         # ── FPS tracking ──────────────────────────────────────────────────
         self.fps_times.append(time.time())
@@ -569,11 +579,9 @@ class RuleBasedFallPlugin:
                 now_ts = time.time()
                 prev_t = self.prev_time.get(person_key, now_ts)
 
+                # ── FIX A: real wall-clock dt, no STREAM_FPS assumption ────
                 raw_dt = now_ts - prev_t
-                if raw_dt <= 0 or raw_dt > self.DT_MAX:
-                    dt = 1.0 / self.STREAM_FPS
-                else:
-                    dt = max(raw_dt, self.DT_MIN)
+                dt     = float(np.clip(raw_dt, self.DT_MIN, self.DT_MAX))
 
                 self.prev_time[person_key] = now_ts
 
@@ -609,7 +617,7 @@ class RuleBasedFallPlugin:
                 self._debug(
                     f"[FallPlugin] PHYSICS cam={cam_id} id={track_id} "
                     f"ratio={body_ratio:.2f} angle={torso_angle:.1f} "
-                    f"drop={drop:.1f} is_upright={is_upright} "
+                    f"drop={drop:.1f} dt={dt*1000:.1f}ms is_upright={is_upright} "
                     f"descent={self.descent_counter[person_key]} "
                     f"impact={self.impact_detected[person_key]} "
                     f"baseline_locked={self.is_baseline_locked.get(person_key, False)}"
@@ -690,14 +698,6 @@ class RuleBasedFallPlugin:
                     self.falling_ids.discard(person_key)
                     if not self.impact_detected[person_key]:
                         self.current_severity[person_key] = FallSeverity.LOW
-                        # NOTE: we still run Path C / D below even without descent,
-                        # because overhead/frontal falls produce little hip Y motion.
-                        # Only skip if impact is also not yet detected.
-                        if not is_overhead:
-                            # For overhead cameras skip the continue so Path C can fire.
-                            # For side/front cameras without enough descent, only Path D
-                            # (frontal) might still be valid — let it through too.
-                            pass
                         # Fall through to Path C / D checks below instead of hard continue.
                         # We use a flag to suppress Path A / B if descent not met.
                         skip_velocity_paths = True
@@ -711,8 +711,8 @@ class RuleBasedFallPlugin:
                 # 5️⃣  IMPACT DETECTION
                 #     Path A — velocity spike
                 #     Path B — body goes horizontal (front cam, sideways fall)
-                #     Path C — NEW: ceiling/overhead expansion
-                #     Path D — NEW: frontal fall (bbox grows + centre drops)
+                #     Path C — ceiling/overhead expansion
+                #     Path D — frontal fall (bbox grows + centre drops)
                 # ══════════════════════════════════════════════════════════
                 if not self.impact_detected[person_key]:
                     ratio_now   = body_ratio
@@ -775,9 +775,6 @@ class RuleBasedFallPlugin:
                             )
 
                     # ── Path D — frontal: bbox diagonal growth + centre drop ────
-                    # Runs for ALL non-overhead cameras (side and front views).
-                    # Requires both diag growth AND centre drop to avoid false
-                    # positives from someone simply walking toward the lens.
                     if not is_overhead and not self.impact_detected[person_key]:
                         fr = self._compute_frontal_signals(
                             person_key, bbox, dt, now_ts
