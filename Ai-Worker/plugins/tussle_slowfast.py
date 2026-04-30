@@ -1,9 +1,9 @@
 import cv2
 import torch
-import numpy as np
 import collections
 from pytorchvideo.models.hub import slowfast_r50
 import torch.nn as nn
+import torchvision.transforms as T
 
 class TusslePlugin:
     def __init__(self, model_path, camera_ids):
@@ -13,10 +13,10 @@ class TusslePlugin:
         # --- SEVERITY MATRIX ---
         # Scaling both Confidence and Sustained counts together
         self.SEVERITY_THRESHOLDS = {
-            "CRITICAL": {"conf": 0.85, "sustained": 4},
-            "HIGH":     {"conf": 0.75, "sustained": 3},
-            "MEDIUM":   {"conf": 0.65, "sustained": 2},
-            "LOW":      {"conf": 0.55, "sustained": 1}
+            "CRITICAL": {"conf": 0.95, "sustained": 1},
+            "HIGH":     {"conf": 0.85, "sustained": 2},
+            "MEDIUM":   {"conf": 0.75, "sustained": 2},
+            "LOW":      {"conf": 0.65, "sustained": 4}
         }
         
         # The lowest baseline needed to even start the suspicious counter
@@ -34,8 +34,17 @@ class TusslePlugin:
             self.model.load_state_dict(torch.load(model_path))
         else:
             self.model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+            
         self.model = self.model.to(self.device)
         self.model.eval()
+
+        # --- GPU-Accelerated Preprocessing Pipeline ---
+        # 1. ToTensor() converts to [C, H, W] in the range [0.0, 1.0]
+        # 2. Resize uses the GPU to downscale to 224x224
+        self.transform = T.Compose([
+            T.ToTensor(), 
+            T.Resize((224, 224), antialias=True)
+        ])
 
         # --- Independent State Management per Camera ---
         self.camera_ids = camera_ids
@@ -70,28 +79,43 @@ class TusslePlugin:
             #print(f"[TusslePlugin][DEBUG] cam_id={cam_id} frame type={type(frame)} shape={getattr(frame, 'shape', None)}")
             if frame is None:
                 continue
-            
+                
             import numpy as np
             if not isinstance(frame, np.ndarray):
                 continue
                 
+            # Convert BGR to RGB 
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            resized = cv2.resize(rgb_frame, (224, 224))
-            self.frame_buffers[cam_id].append(resized)
+            
+            # 👇 GPU ACCELERATION: Convert to tensor and resize on GPU immediately
+            # Shape is [C, H, W]
+            tensor_frame = self.transform(rgb_frame).to(self.device)
+            
+            self.frame_buffers[cam_id].append(tensor_frame)
             self.frame_counters[cam_id] += 1
             
             if len(self.frame_buffers[cam_id]) == 64 and self.frame_counters[cam_id] % self.INFERENCE_INTERVAL == 0:
                 cams_ready_for_inference.append(cam_id)
-                clip = np.array(self.frame_buffers[cam_id])
-                fast = clip[::2][:32]
-                slow = fast[::4][:8]
-                fast_t = torch.from_numpy(fast).permute(3, 0, 1, 2).float() / 255.0
-                slow_t = torch.from_numpy(slow).permute(3, 0, 1, 2).float() / 255.0
-                fast_tensors.append(fast_t)
-                slow_tensors.append(slow_t)
+                
+                # Stack the 64 tensors. Resulting shape: [T, C, H, W]
+                clip = torch.stack(list(self.frame_buffers[cam_id]))
+                
+                # Slicing the tensors along the Temporal (T) dimension
+                fast_t = clip[::2][:32]
+                slow_t = fast_t[::4][:8]
+                
+                # SlowFast requires shape: [C, T, H, W]
+                # Currently they are [T, C, H, W], so we permute dim 0 and 1
+                fast_t = fast_t.permute(1, 0, 2, 3) 
+                slow_t = slow_t.permute(1, 0, 2, 3)
+
+                # Add to batch and cast to FP16 to match your autocast setting!
+                fast_tensors.append(fast_t.half())
+                slow_tensors.append(slow_t.half())
 
         # 2. Run Batched Inference
         if len(cams_ready_for_inference) > 0:
+            # batch shape: [Batch_Size, C, T, H, W]
             batch_fast = torch.stack(fast_tensors).to(self.device)
             batch_slow = torch.stack(slow_tensors).to(self.device)
 
