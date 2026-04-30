@@ -569,7 +569,9 @@ class IngestionService:
                 print(f"[{cam_id}] ⛔ Stop requested. Exiting capture loop.")
                 return
             print(f"[{cam_id}] Connecting to stream...")
-            cap = cv2.VideoCapture(stream_url)
+
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;10000000"
+            cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             if not cap.isOpened():
@@ -579,6 +581,9 @@ class IngestionService:
                 print(f"[{cam_id}] ✅ Opened source: {stream_url}")
 
             consecutive_failures = 0
+            frame_count = 0
+            #start_time = time.time()  # Start the timer
+            #dropped_frame_count = 0 
 
             while cap.isOpened():
                 # check stop event frequently so we can exit quickly when asked
@@ -602,6 +607,7 @@ class IngestionService:
                     break
 
                 consecutive_failures = 0
+                #frame_count += 1  # Increment frame count
 
                 with self.state_lock:
                     cam_queue = self.frame_queues.get(cam_id)
@@ -614,6 +620,7 @@ class IngestionService:
                     # drop oldest frame to make room
                     try:
                         cam_queue.get_nowait()
+                        #dropped_frame_count += 1  # 👈 4. INCREMENT THE COUNTER HERE
                     except queue.Empty:
                         pass
 
@@ -621,6 +628,14 @@ class IngestionService:
                     cam_queue.put_nowait(frame)
                 except queue.Full:
                     pass
+
+                # elapsed_time = time.time() - start_time
+                # if elapsed_time >= 1.0:
+                #     fps = frame_count / elapsed_time
+                #     print(f"[{cam_id}] 📈 Incoming FPS: {fps:.2f} | 🗑️ Dropped: {dropped_frame_count}")                    # Reset timer and frame count
+                #     frame_count = 0
+                #     dropped_frame_count = 0  # 👈 3. RESET DROPPED COUNTER
+                #     start_time = time.time()
 
                 if self.env == "development":
                     elapsed = time.time() - frame_start_time
