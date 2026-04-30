@@ -1,5 +1,6 @@
 import threading
 import time
+#import torch
 
 import cv2
 
@@ -79,11 +80,17 @@ class WorkerRuntime:
                 tussle_input = {
                     cam_id: state["raw_frame"]
                     for cam_id, state in enabled_scene_state.items()
-                    if cam_id in getattr(plugin, "frame_buffers", {})
+                    if cam_id in getattr(plugin, "frame_buffers", {}) 
+                    and len(state.get("tracked_people", {})) >= 2
                 }
                 if not tussle_input:
                     continue
+                #torch.cuda.synchronize()
+                #start_time = time.perf_counter()
                 alerts = plugin.process_batch(tussle_input)
+                #torch.cuda.synchronize()
+                #end_time = time.perf_counter()
+                #print(f"⏱️ Tussle processing time: {end_time - start_time:.2f} seconds")
             else:
                 alerts = plugin.process_batch(enabled_scene_state)
 
@@ -254,6 +261,8 @@ class WorkerRuntime:
         self.setup()
 
         try:
+            #torch.cuda.synchronize()
+            #batch_start_time = time.perf_counter()  # Start timer for batch processing
             while not self.stop_event.is_set():
                 current_batch = self._next_batch()
                 if not current_batch:
@@ -267,18 +276,66 @@ class WorkerRuntime:
                     time.sleep(0.01)
                     continue
 
+                # Measure time before YOLO (backbone) processing
+                #torch.cuda.synchronize()
+                #yolo_start_time = time.perf_counter()
                 scene_state = self.backbone.process_batch(filtered_batch)
+                # Measure time after YOLO (backbone) processing
+                #torch.cuda.synchronize()
+                #yolo_end_time = time.perf_counter()
+
                 if not scene_state:
                     continue
+
+                # Calculate and log YOLO processing FPS
+                #yolo_duration = yolo_end_time - yolo_start_time
+                #yolo_fps = len(filtered_batch) / yolo_duration if yolo_duration > 0 else 0
+                #print(f"📈 YOLO Processing FPS: {yolo_fps:.2f} (Processed {len(filtered_batch)} frames in {yolo_duration:.4f} seconds)")
+
+                # Calculate and log batch processing time
+                #torch.cuda.synchronize() # Force CPU to wait until YOLO is actually done
+                #batch_end_time = time.perf_counter()
+                #batch_duration = batch_end_time - batch_start_time
+                #print(f"⏱️ Batch processed in {batch_duration:.4f} seconds")
+                #torch.cuda.synchronize() # Force CPU to wait until YOLO is actually done
+                #batch_start_time = time.perf_counter()  # Reset timer for next batch
 
                 for cam_id, data in scene_state.items():
                     self.recorder.update_frame(cam_id, data["raw_frame"])
 
+                #torch.cuda.synchronize() # Force CPU to wait until YOLO is actually done
+                #t_start = time.perf_counter()
+                
                 self._run_plugins(scene_state)
+                #torch.cuda.synchronize()
+                #t_plugins = time.perf_counter()
+                
                 self._annotate_frames(scene_state)
+                #torch.cuda.synchronize()
+                #t_annotate = time.perf_counter()
+                
                 self._publish_rtmp_streams(scene_state)
+                #torch.cuda.synchronize()
+                #t_rtmp = time.perf_counter()
+                
                 self._publish_display_frames(scene_state)
+                #torch.cuda.synchronize()
+                #t_publish_display = time.perf_counter()
+                
                 self._render_display_windows()
+                #torch.cuda.synchronize()
+                #t_render = time.perf_counter()
+
+                # Print the breakdown
+                # print("\n--- 🕵️ POST-PROCESSING PROFILER ---")
+                # print(f"Plugins:        {t_plugins - t_start:.4f} seconds")
+                # print(f"Annotate:       {t_annotate - t_plugins:.4f} seconds")
+                # print(f"RTMP Push:      {t_rtmp - t_annotate:.4f} seconds")
+                # print(f"Display Push:   {t_publish_display - t_rtmp:.4f} seconds")
+                # print(f"Render Windows: {t_render - t_publish_display:.4f} seconds")
+                # print(f"TOTAL:          {t_render - t_start:.4f} seconds")
+                # print("-----------------------------------\n")
+                # # ==========================================
 
         except KeyboardInterrupt:
             print("\n🛑 Shutting down system...")
