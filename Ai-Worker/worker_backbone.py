@@ -29,6 +29,8 @@ class SharedBackbone:
             classes=[0],
             verbose=False,
             tracker="botsort.yaml",
+            device=self.device,  # Forces Ultralytics to keep tensors on the GPU
+            half=True,
         )
 
         scene_state = {}
